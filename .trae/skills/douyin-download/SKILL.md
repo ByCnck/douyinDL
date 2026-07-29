@@ -38,7 +38,7 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl "<分享链接或文本>" -o
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `url` | 抖音分享链接或包含链接的分享文本（必填） | - |
+| `url` | 抖音分享链接或包含链接的分享文本（必填）；支持空格分隔多个链接 | - |
 | `-o, --output` | 视频保存根目录 | `./downloads`（config.yaml 可改） |
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |
@@ -81,6 +81,11 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
 # 8. 强制重新下载（忽略进度记录，覆盖已有文件）
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/SlGTwuMq498/" -f
+
+# 9. 批量下载多个链接（空格分隔，串行执行）
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/LusIAXyGX-I/ https://v.douyin.com/w531WJ7dzEw/" \
+  -o ./downloads
 ```
 
 ## 输出结构

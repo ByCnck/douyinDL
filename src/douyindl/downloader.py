@@ -943,7 +943,7 @@ def main():
     )
     parser.add_argument(
         "url",
-        help="抖音分享链接（短链或完整URL，可包含分享文本）",
+        help="抖音分享链接（短链或完整URL，可包含分享文本）；支持空格分隔多个链接",
     )
     parser.add_argument(
         "-o", "--output",
@@ -973,12 +973,13 @@ def main():
     )
     args = parser.parse_args()
 
-    # 从分享文本中提取 URL
-    url_match = re.search(r'https?://[^\s，,]+', args.url)
-    if not url_match:
+    # 从分享文本中提取所有 URL（支持空格/换行分隔多链接）
+    # 用户可能用反引号包裹 URL（如 markdown 示例），strip 掉反引号
+    urls = re.findall(r'https?://[^\s，,]+', args.url)
+    urls = [u.strip("`") for u in urls if u.strip("`")]
+    if not urls:
         print("错误: 未在输入中找到有效的 URL", file=sys.stderr)
         sys.exit(1)
-    url = url_match.group(0)
 
     # 加载配置
     config_path = Path(args.config) if args.config else None
@@ -1010,7 +1011,15 @@ def main():
         config=config,
         force=args.force,
     )
-    asyncio.run(dl.run(url))
+
+    # 多链接串行下载（asyncio.run 只能调用一次，包一层协程循环）
+    async def run_all() -> None:
+        for i, url in enumerate(urls, 1):
+            if len(urls) > 1:
+                print(f"\n========== [{i}/{len(urls)}] {url} ==========")
+            await dl.run(url)
+
+    asyncio.run(run_all())
 
 
 if __name__ == "__main__":

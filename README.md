@@ -41,7 +41,7 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `url` | 抖音分享链接或包含链接的分享文本（必填） | - |
+| `url` | 抖音分享链接或包含链接的分享文本（必填）；支持空格分隔多个链接 | - |
 | `-o, --output` | 视频保存根目录 | `./downloads` |
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |

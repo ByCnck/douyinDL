@@ -20,7 +20,7 @@ uv run python -m douyindl <url> [选项]
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `url` | 抖音分享链接或包含链接的分享文本（必填） | - |
+| `url` | 抖音分享链接或包含链接的分享文本（必填）；支持空格分隔多个链接 | - |
 | `-o, --output` | 视频保存根目录 | `./downloads`（config.yaml 可改） |
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |
@@ -28,6 +28,7 @@ uv run python -m douyindl <url> [选项]
 | `-m [TYPES]` | 保存元数据，可选 `all`/`cover`/`desc`/`music`/`json`（逗号分隔）；仅 `-m` 等同于 `all` | 关闭 |
 
 > `url` 支持直接粘贴抖音 App 分享的完整文本（含乱码字符），脚本会用正则自动提取其中的 URL。
+> 也支持空格分隔多个链接，串行下载（详见下方场景 7）。
 
 ## 使用场景
 
@@ -93,6 +94,27 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/SlGTwuMq498/" -c /path/to/custom-config.yaml
 ```
+
+### 7. 批量下载多个链接
+
+`url` 参数支持空格分隔多个链接，脚本自动提取所有 URL 并串行下载。
+
+```bash
+# 两个单视频链接
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/LusIAXyGX-I/ https://v.douyin.com/w531WJ7dzEw/" \
+  -o ./downloads
+
+# 混合合集与单视频
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/SlGTwuMq498/ https://v.douyin.com/LQVBJcukSyA/" \
+  -o ./downloads
+```
+
+每个链接会打印分隔线 `========== [1/2] <url> ==========`，串行执行：
+- 合集链接内部仍按 60 秒间隔下载
+- 单视频链接之间无额外等待
+- 进度数据库记录不受影响，断点续传/增量下载正常工作
 
 ## 输出结构
 
