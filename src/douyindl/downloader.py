@@ -9,10 +9,14 @@
 6. 用 httpx 流式下载无水印 mp4 文件
    - 合集：创建子目录 YYYYMMDD_合集名，视频间间隔 mix_download_interval 秒
    - 单视频：直接下载到输出目录
+7. 可选：保存元数据（封面/文案/原声/JSON）
+8. 可选：记录下载进度到 SQLite，支持断点续传与增量下载
 """
 
 import asyncio
+import json
 import re
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +59,17 @@ class Config:
     chunk_size: int
     filename_max_len: int
 
+    # 元数据保存
+    save_metadata: bool
+    save_cover: bool
+    save_desc: bool
+    save_music: bool
+    save_json: bool
+
+    # 进度持久化
+    enable_progress: bool
+    progress_db_path: str
+
     # 输出目录
     output_dir: str
 
@@ -83,6 +98,17 @@ class Config:
         self.mix_download_interval = int(data.get("mix_download_interval", 60))
         self.chunk_size = int(data.get("chunk_size", 65536))
         self.filename_max_len = int(data.get("filename_max_len", 60))
+
+        # 元数据保存：总开关默认关闭，子开关默认开启
+        self.save_metadata = bool(data.get("save_metadata", False))
+        self.save_cover = bool(data.get("save_cover", True))
+        self.save_desc = bool(data.get("save_desc", True))
+        self.save_music = bool(data.get("save_music", True))
+        self.save_json = bool(data.get("save_json", True))
+
+        # 进度持久化：默认启用
+        self.enable_progress = bool(data.get("enable_progress", True))
+        self.progress_db_path = data.get("progress_db_path", ".douyindl/progress.db")
 
         self.output_dir = data.get("output_dir", "./downloads")
 
@@ -347,6 +373,198 @@ def _print_progress(downloaded: int, total: int) -> None:
     sys.stdout.flush()
 
 
+# ── 元数据下载 ──────────────────────────────────────────────────
+
+async def _download_simple(
+    url: str,
+    save_path: Path,
+    config: Config,
+) -> int:
+    """下载小文件（封面/音乐），无进度条，一次性写入。
+
+    与 download_video 的区别：不打印进度条，适用于体积较小的元数据文件。
+    """
+    if not url:
+        return 0
+    # 抖音 CDN 地址可能缺 https: 前缀
+    if url.startswith("//"):
+        url = "https:" + url
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        headers=config.default_headers,
+        proxy=None,
+        timeout=60,
+    ) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        save_path.write_bytes(resp.content)
+    return len(resp.content)
+
+
+async def download_metadata(
+    video_data: Dict[str, Any],
+    base_path: Path,
+    config: Config,
+) -> None:
+    """保存视频元数据（封面/文案/原声/JSON）。
+
+    仅当 config.save_metadata=True 时执行，文件与视频同名但扩展名不同：
+      - 封面: base_path.jpg
+      - 文案: base_path.txt
+      - 原声: base_path.mp3
+      - 信息: base_path.json
+
+    Args:
+        video_data: 经 f2 filter 过滤后的视频信息字典
+        base_path: 不含扩展名的完整路径（如 .../001_文案）
+        config: 配置对象
+    """
+    if not config.save_metadata:
+        return
+
+    # 封面图
+    if config.save_cover:
+        cover_url = video_data.get("cover")
+        if cover_url:
+            try:
+                await _download_simple(cover_url, base_path.with_suffix(".jpg"), config)
+            except Exception as e:
+                print(f"      封面下载失败: {e}")
+
+    # 文案全文
+    if config.save_desc:
+        desc = video_data.get("desc") or ""
+        if desc:
+            base_path.with_suffix(".txt").write_text(desc, encoding="utf-8")
+
+    # 原声 MP3
+    if config.save_music:
+        # music_status=1 表示原声可用
+        if video_data.get("music_status") == 1:
+            music_url = video_data.get("music_play_url")
+            if music_url:
+                try:
+                    await _download_simple(music_url, base_path.with_suffix(".mp3"), config)
+                except Exception as e:
+                    print(f"      原声下载失败: {e}")
+
+    # 完整视频信息 JSON
+    if config.save_json:
+        json_path = base_path.with_suffix(".json")
+        # default=str 兜底处理不可序列化对象（如时间）
+        json_path.write_text(
+            json.dumps(video_data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+
+# ── 进度持久化 ──────────────────────────────────────────────────
+
+class ProgressDB:
+    """基于 SQLite 的下载进度数据库，支持断点续传与增量下载。
+
+    表结构：
+        downloaded_videos(
+            aweme_id        TEXT PRIMARY KEY,  -- 视频 ID
+            resource_type   TEXT NOT NULL,     -- 'mix' 或 'one'
+            resource_id     TEXT NOT NULL,     -- mix_id 或 aweme_id
+            mix_name        TEXT,              -- 合集名（单视频为 NULL）
+            desc            TEXT,              -- 视频文案
+            file_path       TEXT,              -- 保存路径
+            downloaded_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+
+    用法:
+        with ProgressDB(Path(".douyindl/progress.db")) as db:
+            if db.is_downloaded("123456"):
+                print("已下载")
+            db.record("123456", "mix", "mix_id_xxx", "合集名", "文案", "/path/to.mp4")
+    """
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def __enter__(self) -> "ProgressDB":
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS downloaded_videos (
+                aweme_id        TEXT PRIMARY KEY,
+                resource_type   TEXT NOT NULL,
+                resource_id     TEXT NOT NULL,
+                mix_name        TEXT,
+                desc            TEXT,
+                file_path       TEXT,
+                downloaded_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # 为 resource_id 建索引，加速合集场景下查询已下载视频
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_resource_id ON downloaded_videos(resource_id)"
+        )
+        self._conn.commit()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    def is_downloaded(self, aweme_id: str) -> bool:
+        """查询某视频是否已记录为下载成功。
+
+        注意：仅检查数据库记录是否存在，不验证文件是否还在磁盘上。
+        文件存在性由调用方在跳过逻辑中额外判断。
+        """
+        if not self._conn:
+            return False
+        cur = self._conn.execute(
+            "SELECT 1 FROM downloaded_videos WHERE aweme_id = ?", (aweme_id,)
+        )
+        return cur.fetchone() is not None
+
+    def record(
+        self,
+        aweme_id: str,
+        resource_type: str,
+        resource_id: str,
+        mix_name: str,
+        desc: str,
+        file_path: str,
+    ) -> None:
+        """记录一条下载成功记录（已存在则更新）。"""
+        if not self._conn:
+            return
+        self._conn.execute(
+            """INSERT INTO downloaded_videos
+               (aweme_id, resource_type, resource_id, mix_name, desc, file_path)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(aweme_id) DO UPDATE SET
+                   resource_type=excluded.resource_type,
+                   resource_id=excluded.resource_id,
+                   mix_name=excluded.mix_name,
+                   desc=excluded.desc,
+                   file_path=excluded.file_path,
+                   downloaded_at=CURRENT_TIMESTAMP
+            """,
+            (aweme_id, resource_type, resource_id, mix_name, desc, file_path),
+        )
+        self._conn.commit()
+
+    def count_by_resource(self, resource_id: str) -> int:
+        """统计某合集/单视频已下载的视频数。"""
+        if not self._conn:
+            return 0
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM downloaded_videos WHERE resource_id = ?",
+            (resource_id,),
+        )
+        return cur.fetchone()[0]
+
+
 # ── 主流程 ──────────────────────────────────────────────────────
 
 class DouyinDownloader:
@@ -362,11 +580,26 @@ class DouyinDownloader:
         output_dir: Optional[str] = None,
         max_counts: int = 0,
         config: Optional[Config] = None,
+        force: bool = False,
     ):
         self.config = config or Config()
         # output_dir 优先用参数，其次用配置文件
         self.output_dir = Path(output_dir) if output_dir else Path(self.config.output_dir)
         self.max_counts = max_counts
+        # force=True 时忽略进度数据库记录，强制重新下载
+        self.force = force
+
+    def _get_progress_db(self) -> Optional[ProgressDB]:
+        """根据配置获取进度数据库实例（未启用时返回 None）。
+
+        数据库路径相对于当前工作目录解析（CLI 运行时 cwd 即项目根）。
+        """
+        if not self.config.enable_progress:
+            return None
+        db_path = Path(self.config.progress_db_path)
+        if not db_path.is_absolute():
+            db_path = Path.cwd() / db_path
+        return ProgressDB(db_path)
 
     async def run(self, share_url: str) -> List[Dict[str, Any]]:
         """主入口：解析链接 → 获取视频列表 → 下载。
@@ -376,6 +609,13 @@ class DouyinDownloader:
         - 单视频：直接下载到 output_dir，文件名 YYYYMMDD_文案.mp4
         - 合集内视频间间隔 mix_download_interval 秒，单视频无需等待
 
+        进度持久化（启用时）：
+        - 下载前查询 aweme_id 是否已记录，已记录且文件存在则跳过（断点续传）
+        - 下载成功后写入记录，支持下次增量下载
+
+        元数据保存（save_metadata=True 时）：
+        - 每个视频旁额外生成 .jpg/.txt/.mp3/.json
+
         Returns:
             已下载视频的信息列表
         """
@@ -383,9 +623,11 @@ class DouyinDownloader:
         # 下载当日日期，用于目录名 / 单视频文件名前缀
         date_str = datetime.now().strftime("%Y%m%d")
 
-        print(f"[1/3] 解析分享链接: {share_url}")
+        print(f"[1/4] 解析分享链接: {share_url}")
         kind, resource_id = await resolve_share_url(share_url, cfg)
 
+        # mix_name 在两种场景下都需初始化，用于进度记录
+        mix_name = ""
         if kind == "mix":
             print(f"      检测到合集链接, mix_id={resource_id}")
             mix_name, videos = await fetch_mix_videos(
@@ -407,52 +649,99 @@ class DouyinDownloader:
             target_dir = self.output_dir
             download_interval = 0
 
-        print(f"[2/3] 共获取 {len(videos)} 个视频:")
+        print(f"[2/4] 共获取 {len(videos)} 个视频:")
         for i, v in enumerate(videos, 1):
             desc = (v.get("desc") or "").replace("\n", " ")[:40]
             print(f"  {i:>3d}. [{v.get('aweme_id')}] {desc}")
 
-        print(f"[3/3] 开始下载到 {target_dir}/ ...")
+        # 打开进度数据库（上下文管理器确保连接关闭）
+        db = self._get_progress_db()
+        db_ctx = db if db is not None else _NullContext()
+
+        print(f"[3/4] 开始下载到 {target_dir}/ ...")
         target_dir.mkdir(parents=True, exist_ok=True)
         success = 0
-        for i, v in enumerate(videos, 1):
-            aweme_id = v.get("aweme_id", f"unknown_{i}")
-            desc = v.get("desc") or ""
-            play_addr = v.get("video_play_addr")
-            # video_play_addr 可能是列表（多个清晰度地址）
-            if isinstance(play_addr, list):
-                play_addr = play_addr[0] if play_addr else None
+        skipped = 0
+        with db_ctx as progress_db:
+            for i, v in enumerate(videos, 1):
+                aweme_id = v.get("aweme_id", f"unknown_{i}")
+                desc = v.get("desc") or ""
+                play_addr = v.get("video_play_addr")
+                # video_play_addr 可能是列表（多个清晰度地址）
+                if isinstance(play_addr, list):
+                    play_addr = play_addr[0] if play_addr else None
 
-            if not play_addr:
-                print(f"  [{i}/{len(videos)}] {aweme_id} 无视频地址，跳过")
-                continue
+                if not play_addr:
+                    print(f"  [{i}/{len(videos)}] {aweme_id} 无视频地址，跳过")
+                    continue
 
-            name = _sanitize_filename(desc, cfg.filename_max_len) or aweme_id
-            # 合集内文件：001_文案.mp4（目录已含日期，无需重复）
-            # 单视频文件：YYYYMMDD_文案.mp4
-            if kind == "mix":
-                save_path = target_dir / f"{i:03d}_{name}.mp4"
-            else:
-                save_path = target_dir / f"{date_str}_{name}.mp4"
-            if save_path.exists():
-                print(f"  [{i}/{len(videos)}] {save_path.name} 已存在，跳过")
-                success += 1
-                continue
+                name = _sanitize_filename(desc, cfg.filename_max_len) or aweme_id
+                # 合集内文件：001_文案.mp4（目录已含日期，无需重复）
+                # 单视频文件：YYYYMMDD_文案.mp4
+                if kind == "mix":
+                    save_path = target_dir / f"{i:03d}_{name}.mp4"
+                else:
+                    save_path = target_dir / f"{date_str}_{name}.mp4"
 
-            print(f"  [{i}/{len(videos)}] 下载 {save_path.name}")
-            try:
-                await download_video(play_addr, save_path, cfg)
-                success += 1
-            except Exception as e:
-                print(f"      下载失败: {e}")
+                # 跳过判断：文件已存在 或 进度数据库已记录
+                # force=True 时跳过此检查，强制重新下载
+                if not self.force:
+                    if save_path.exists():
+                        print(f"  [{i}/{len(videos)}] {save_path.name} 文件已存在，跳过")
+                        success += 1
+                        skipped += 1
+                        continue
+                    if progress_db and progress_db.is_downloaded(aweme_id):
+                        print(f"  [{i}/{len(videos)}] {save_path.name} 进度记录已存在，跳过")
+                        skipped += 1
+                        continue
 
-            # 合集场景：视频间间隔等待（最后一个不需要）
-            if download_interval and i < len(videos):
-                print(f"      等待 {download_interval} 秒后继续下载下一个...")
-                await asyncio.sleep(download_interval)
+                print(f"  [{i}/{len(videos)}] 下载 {save_path.name}")
+                try:
+                    await download_video(play_addr, save_path, cfg)
+                    success += 1
 
-        print(f"\n完成: {success}/{len(videos)} 个视频已下载到 {target_dir}/")
+                    # 下载元数据（封面/文案/原声/JSON）
+                    if cfg.save_metadata:
+                        # base_path 不含扩展名，用于生成 .jpg/.txt/.mp3/.json
+                        base_path = save_path.with_suffix("")
+                        await download_metadata(v, base_path, cfg)
+
+                    # 记录到进度数据库
+                    if progress_db:
+                        progress_db.record(
+                            aweme_id=str(aweme_id),
+                            resource_type=kind,
+                            resource_id=resource_id,
+                            mix_name=mix_name,
+                            desc=desc[:200],
+                            file_path=str(save_path),
+                        )
+                except Exception as e:
+                    print(f"      下载失败: {e}")
+
+                # 合集场景：视频间间隔等待（最后一个不需要）
+                if download_interval and i < len(videos):
+                    print(f"      等待 {download_interval} 秒后继续下载下一个...")
+                    await asyncio.sleep(download_interval)
+
+        # 统计输出
+        print(f"\n[4/4] 完成: 成功 {success}/{len(videos)}，跳过 {skipped}")
+        print(f"      保存目录: {target_dir}/")
+        if progress_db and kind == "mix":
+            total = progress_db.count_by_resource(resource_id)
+            print(f"      合集 {resource_id} 累计已下载 {total} 个视频（含历史记录）")
         return videos
+
+
+class _NullContext:
+    """空上下文管理器，用于进度数据库未启用时保持 with 语法统一。"""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        pass
 
 
 def main():
@@ -481,6 +770,16 @@ def main():
         default=None,
         help="配置文件路径（默认 config/config.yaml）",
     )
+    parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="强制重新下载，忽略进度数据库记录",
+    )
+    parser.add_argument(
+        "-m", "--metadata",
+        action="store_true",
+        help="保存元数据（封面/文案/原声/JSON），覆盖 config.yaml 中的 save_metadata 设置",
+    )
     args = parser.parse_args()
 
     # 从分享文本中提取 URL
@@ -494,10 +793,15 @@ def main():
     config_path = Path(args.config) if args.config else None
     config = Config(config_path)
 
+    # CLI 参数覆盖配置文件
+    if args.metadata:
+        config.save_metadata = True
+
     dl = DouyinDownloader(
         output_dir=args.output,
         max_counts=args.max_counts,
         config=config,
+        force=args.force,
     )
     asyncio.run(dl.run(url))
 

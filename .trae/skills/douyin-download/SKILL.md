@@ -12,6 +12,8 @@ description: "Downloads Douyin (抖音) videos or video collections from share l
 - **合集**：创建子目录 `YYYYMMDD_合集名/`，视频间间隔 60 秒下载（防封 IP），文件名 `001_文案.mp4`
 - **单视频**：直接下载到输出目录，文件名 `YYYYMMDD_文案.mp4`
 - **配置化**：UA、chunk 大小、间隔时间等参数集中在 `config/config.yaml`
+- **元数据保存**：可选下载封面/文案/原声/JSON（`-m` 或配置 `save_metadata: true`）
+- **进度持久化**：基于 SQLite 记录已下载视频，支持断点续传与增量下载（防重复下载）
 
 ## 触发条件
 
@@ -40,6 +42,8 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl "<分享链接或文本>" -o
 | `-o, --output` | 视频保存根目录 | `./downloads`（config.yaml 可改） |
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |
+| `-f, --force` | 强制重新下载，忽略进度数据库记录 | 关闭 |
+| `-m, --metadata` | 保存元数据（封面/文案/原声/JSON） | 关闭 |
 
 ### 示例
 
@@ -61,6 +65,14 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
 # 4. 使用自定义配置文件
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/SlGTwuMq498/" -c /path/to/config.yaml
+
+# 5. 下载合集并保存元数据（封面/文案/原声/JSON）
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/SlGTwuMq498/" -m
+
+# 6. 强制重新下载（忽略进度记录，覆盖已有文件）
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/SlGTwuMq498/" -f
 ```
 
 ## 输出结构
@@ -69,9 +81,16 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
 downloads/
 ├── 20260729_翟东升看百年大变局/        # 合集目录（日期_合集名）
 │   ├── 001_翟东升_既得利益者肤浅.mp4
+│   ├── 001_翟东升_既得利益者肤浅.jpg    # 封面（-m 时生成）
+│   ├── 001_翟东升_既得利益者肤浅.txt    # 文案（-m 时生成）
+│   ├── 001_翟东升_既得利益者肤浅.mp3    # 原声（-m 时生成）
+│   ├── 001_翟东升_既得利益者肤浅.json   # 视频信息（-m 时生成）
 │   ├── 002_翟东升_美元体系其实是特例.mp4
 │   └── ...
 └── 20260729_用最好的动画讲解HBM原理.mp4  # 单视频（日期_文案）
+
+.douyindl/
+└── progress.db                          # SQLite 进度数据库（自动创建）
 ```
 
 ## 配置文件
@@ -87,6 +106,10 @@ downloads/
 | `mix_download_interval` | 合集视频下载间隔（秒，防封 IP） | 60 |
 | `chunk_size` | 流式下载 chunk 大小（字节） | 65536 |
 | `filename_max_len` | 文件名最大长度 | 60 |
+| `save_metadata` | 是否保存元数据（封面/文案/原声/JSON） | false |
+| `save_cover` / `save_desc` / `save_music` / `save_json` | 元数据子开关 | true |
+| `enable_progress` | 是否启用进度数据库 | true |
+| `progress_db_path` | 进度数据库路径 | `.douyindl/progress.db` |
 | `output_dir` | 默认输出目录 | `./downloads` |
 
 ## 技术原理

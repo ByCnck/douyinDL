@@ -42,6 +42,30 @@ chunk_size: 65536
 filename_max_len: 60
 
 
+# ── 元数据保存 ────────────────────────────────────────────────
+
+# 总开关：是否额外保存视频元数据（封面/文案/原声/JSON）
+# 开启后，每个视频旁边会生成同名 .jpg/.txt/.mp3/.json 文件
+save_metadata: false
+
+# 子开关（仅当 save_metadata=true 时生效）
+save_cover: true       # 视频封面图 (.jpg)
+save_desc: true        # 视频文案全文 (.txt)
+save_music: true       # 原声 MP3 (.mp3)
+save_json: true        # 完整视频信息 JSON (.json)
+
+
+# ── 进度持久化 ────────────────────────────────────────────────
+
+# 是否启用进度数据库（SQLite），用于断点续传和增量下载
+# 启用后，已成功下载的视频会记录到 .douyindl/progress.db
+# 再次下载同一合集时，已下载的视频会自动跳过
+enable_progress: true
+
+# 进度数据库路径（默认项目根目录 .douyindl/progress.db）
+progress_db_path: ".douyindl/progress.db"
+
+
 # ── 输出目录相关 ──────────────────────────────────────────────
 
 # 默认输出根目录（CLI -o 参数可覆盖）

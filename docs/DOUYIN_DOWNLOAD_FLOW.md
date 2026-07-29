@@ -2,7 +2,7 @@
 
 > 项目路径：`/Users/zhenxi/codes/python/douyinDL`
 > 文档创建日期：2026-07-29
-> 版本：v0.2.0
+> 版本：v0.3.0
 
 ---
 
@@ -15,10 +15,12 @@
 5. [配置文件说明](#5-配置文件说明)
 6. [开发流程](#6-开发流程)
 7. [核心技术原理](#7-核心技术原理)
-8. [使用指南](#8-使用指南)
-9. [Skill 集成](#9-skill-集成)
-10. [常见问题与排查](#10-常见问题与排查)
-11. [后续扩展方向](#11-后续扩展方向)
+8. [元数据保存](#8-元数据保存)
+9. [进度持久化](#9-进度持久化)
+10. [使用指南](#10-使用指南)
+11. [Skill 集成](#11-skill-集成)
+12. [常见问题与排查](#12-常见问题与排查)
+13. [后续扩展方向](#13-后续扩展方向)
 
 ---
 
@@ -90,13 +92,19 @@ douyinDL/
 │   └── skills/
 │       └── douyin-download/
 │           └── SKILL.md              # Skill 定义文件
+├── .douyindl/                       # 进度数据库目录（运行时自动创建，.gitignore 忽略）
+│   └── progress.db                  # SQLite 下载进度记录
 ├── config/
-│   └── config.yaml                  # 配置文件（UA/间隔/chunk_size 等）
+│   └── config.yaml                  # 配置文件（UA/间隔/chunk_size/元数据/进度等）
 ├── docs/
 │   └── DOUYIN_DOWNLOAD_FLOW.md      # 本文档
 ├── downloads/                       # 视频下载目录（运行时自动创建，.gitignore 忽略）
 │   ├── 20260729_翟东升看百年大变局/  # 合集子目录（日期_合集名）
 │   │   ├── 001_xxx.mp4
+│   │   ├── 001_xxx.jpg              # 封面（-m 时生成）
+│   │   ├── 001_xxx.txt              # 文案（-m 时生成）
+│   │   ├── 001_xxx.mp3              # 原声（-m 时生成）
+│   │   ├── 001_xxx.json             # 视频信息（-m 时生成）
 │   │   └── ...
 │   └── 20260729_单视频文案.mp4       # 单视频（日期_文案）
 ├── logs/                            # f2 运行日志（.gitignore 忽略）
@@ -104,7 +112,7 @@ douyinDL/
 │   └── douyindl/
 │       ├── __init__.py              # 包入口，导出 DouyinDownloader / main
 │       ├── __main__.py              # 支持 python -m douyindl 运行
-│       └── downloader.py            # 核心下载逻辑
+│       └── downloader.py            # 核心下载逻辑（含元数据/进度持久化）
 ├── .gitignore
 ├── pyproject.toml                   # 项目依赖与构建配置
 └── uv.lock                          # uv 锁定的依赖版本
@@ -118,13 +126,16 @@ douyinDL/
 
 | 函数/类 | 职责 |
 | ---- | ---- |
-| `Config` | 从 `config.yaml` 加载配置（UA、间隔、chunk_size 等） |
+| `Config` | 从 `config.yaml` 加载配置（UA、间隔、chunk_size、元数据开关、进度开关等） |
 | `resolve_share_url(share_url, config)` | 解析分享短链，返回 `(kind, resource_id)` |
 | `build_cookie()` | 生成匿名 cookie（ttwid + 伪 msToken） |
 | `fetch_mix_videos(mix_id, config, ...)` | 分页获取合集全部视频列表，返回 `(合集名, 视频列表)` |
 | `fetch_one_video(aweme_id, config)` | 获取单个视频详情（使用 `_to_dict()` 而非 `_to_list()`） |
 | `download_video(url, path, config, ...)` | httpx 流式下载无水印 MP4 |
-| `DouyinDownloader` | 主流程类，串联解析→获取→下载 |
+| `_download_simple(url, path, config)` | 下载小文件（封面/音乐），无进度条 |
+| `download_metadata(video_data, base_path, config)` | 保存元数据（封面/文案/原声/JSON） |
+| `ProgressDB` | 基于 SQLite 的下载进度数据库，支持断点续传与增量下载 |
+| `DouyinDownloader` | 主流程类，串联解析→获取→下载→元数据→进度记录 |
 
 #### `pyproject.toml`
 
@@ -258,6 +269,30 @@ chunk_size: 65536
 
 # 下载文件名最大长度（字符）
 filename_max_len: 60
+
+
+# ── 元数据保存 ────────────────────────────────────────────────
+
+# 总开关：是否额外保存视频元数据（封面/文案/原声/JSON）
+# 开启后，每个视频旁边会生成同名 .jpg/.txt/.mp3/.json 文件
+save_metadata: false
+
+# 子开关（仅当 save_metadata=true 时生效）
+save_cover: true       # 视频封面图 (.jpg)
+save_desc: true        # 视频文案全文 (.txt)
+save_music: true       # 原声 MP3 (.mp3)
+save_json: true        # 完整视频信息 JSON (.json)
+
+
+# ── 进度持久化 ────────────────────────────────────────────────
+
+# 是否启用进度数据库（SQLite），用于断点续传和增量下载
+# 启用后，已成功下载的视频会记录到 .douyindl/progress.db
+# 再次下载同一合集时，已下载的视频会自动跳过
+enable_progress: true
+
+# 进度数据库路径（默认项目根目录 .douyindl/progress.db）
+progress_db_path: ".douyindl/progress.db"
 
 
 # ── 输出目录相关 ──────────────────────────────────────────────
@@ -484,9 +519,199 @@ API 返回的合集视频数据经 `UserMixFilter` 过滤后，关键字段：
 
 ---
 
-## 8. 使用指南
+## 8. 元数据保存
 
-### 8.1 基本用法
+### 8.1 功能概述
+
+v0.3.0 新增元数据保存功能，在下载视频的同时可选择保存以下附属文件：
+
+| 文件类型 | 扩展名 | 来源字段 | 说明 |
+| ---- | ---- | ---- | ---- |
+| 封面图 | `.jpg` | `cover` | 视频封面，来自抖音 CDN |
+| 文案全文 | `.txt` | `desc` | 视频描述文本，含 #话题标签 |
+| 原声 MP3 | `.mp3` | `music_play_url` | 视频背景音乐/原声 |
+| 视频信息 | `.json` | 完整字典 | 含 aweme_id、作者、时间、统计等全部字段 |
+
+### 8.2 启用方式
+
+**方式一：CLI 参数（单次生效）**
+
+```bash
+# 下载时加 -m 参数，本次下载会保存元数据
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl "https://v.douyin.com/xxx/" -m
+```
+
+**方式二：配置文件（永久生效）**
+
+```yaml
+# config/config.yaml
+save_metadata: true   # 总开关
+save_cover: true      # 封面
+save_desc: true       # 文案
+save_music: true      # 原声
+save_json: true       # JSON
+```
+
+### 8.3 命名规则
+
+元数据文件与视频文件同基础名，仅扩展名不同：
+
+```
+downloads/20260729_翟东升看百年大变局/
+├── 001_翟东升_xxx.mp4     # 视频本体
+├── 001_翟东升_xxx.jpg     # 封面
+├── 001_翟东升_xxx.txt     # 文案
+├── 001_翟东升_xxx.mp3     # 原声
+└── 001_翟东升_xxx.json    # 完整信息
+```
+
+### 8.4 实现细节
+
+元数据下载由 `download_metadata()` 函数编排（`src/douyindl/downloader.py`）：
+
+1. **封面/原声**：调用 `_download_simple()` 通过 httpx 一次性下载（小文件，无需进度条）
+2. **文案**：直接将 `desc` 字段写入 `.txt` 文件（UTF-8 编码）
+3. **JSON**：将完整视频信息字典序列化为 JSON，`default=str` 兜底处理不可序列化对象
+
+容错策略：封面或原声下载失败时打印警告但不中断主流程，视频本身仍会正常下载。
+
+### 8.5 JSON 字段示例
+
+`save_json` 保存的 JSON 文件包含 f2 filter 过滤后的全部字段（约 76 个），关键字段：
+
+```json
+{
+  "aweme_id": "7652697983779114286",
+  "desc": "用最好的动画为你讲解--HBM的原理 HBM 显存...",
+  "nickname": "Redknot_乔红",
+  "create_time": "2026-06-18 19-36-45",
+  "duration": 1004667,
+  "digg_count": 79323,
+  "comment_count": 2360,
+  "share_count": 18467,
+  "cover": "https://p3-pc-sign.douyinpic.com/...",
+  "video_play_addr": ["https://v11-weba.douyinvod.com/..."],
+  "music_play_url": "https://sf11-cdn-tos.douyinstatic.com/...",
+  "mix_id": "7414791609114216448",
+  "mix_name": "乔红的半导体世界"
+}
+```
+
+---
+
+## 9. 进度持久化
+
+### 9.1 功能概述
+
+v0.3.0 新增基于 SQLite 的下载进度数据库，解决以下场景：
+
+- **断点续传**：下载中断后重新运行，已下载的视频自动跳过，只下载未完成的部分
+- **增量下载**：合集新增视频后重新运行，只下载新增的视频
+- **防重复**：避免同一视频被多次下载
+
+### 9.2 数据库结构
+
+数据库路径：`.douyindl/progress.db`（相对项目根目录，可在 `config.yaml` 中修改）
+
+表结构：
+
+```sql
+CREATE TABLE downloaded_videos (
+    aweme_id        TEXT PRIMARY KEY,    -- 视频 ID（主键）
+    resource_type   TEXT NOT NULL,       -- 'mix'（合集）或 'one'（单视频）
+    resource_id     TEXT NOT NULL,       -- mix_id 或 aweme_id
+    mix_name        TEXT,                -- 合集名（单视频为空）
+    desc            TEXT,                -- 视频文案（截断 200 字符）
+    file_path       TEXT,                -- 保存路径
+    downloaded_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_resource_id ON downloaded_videos(resource_id);
+```
+
+`resource_id` 字段建立索引，加速合集场景下「该合集已下载多少视频」的查询。
+
+### 9.3 工作流程
+
+```
+下载请求
+   │
+   ▼
+查询 aweme_id 是否在数据库中？
+   │
+   ├── 是 ──→ 跳过下载（打印"进度记录已存在，跳过"）
+   │
+   └── 否 ──→ 下载视频
+                │
+                ├── 成功 ──→ 保存元数据（可选）→ 写入数据库 → 等待间隔
+                │
+                └── 失败 ──→ 打印错误，不写入数据库（下次会重试）
+```
+
+关键点：**只有下载成功才写入数据库**。失败的视频下次运行时会重新下载。
+
+### 9.4 配置与控制
+
+**配置文件控制**：
+
+```yaml
+# config/config.yaml
+enable_progress: true              # 总开关，默认启用
+progress_db_path: ".douyindl/progress.db"  # 数据库路径
+```
+
+**CLI 参数控制**：
+
+```bash
+# 强制重新下载，忽略进度记录（覆盖已有文件）
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl "https://v.douyin.com/xxx/" -f
+```
+
+`-f/--force` 参数会跳过所有进度检查和文件存在检查，强制重新下载所有视频。
+
+### 9.5 实现细节
+
+进度数据库由 `ProgressDB` 类管理（`src/douyindl/downloader.py`）：
+
+- 使用 Python 标准库 `sqlite3`，**无需额外依赖**
+- 通过上下文管理器（`with` 语句）确保数据库连接正确关闭
+- `ON CONFLICT(aweme_id) DO UPDATE` 语法实现 upsert：已存在则更新，不存在则插入
+- 未启用进度功能时，通过 `_NullContext` 空上下文管理器保持代码统一
+
+```python
+# 使用示例
+with ProgressDB(Path(".douyindl/progress.db")) as db:
+    if db.is_downloaded("7652697983779114286"):
+        print("已下载，跳过")
+    else:
+        # 下载视频...
+        db.record(
+            aweme_id="7652697983779114286",
+            resource_type="mix",
+            resource_id="7658437054228858923",
+            mix_name="翟东升看百年大变局",
+            desc="翟东升：既得利益者肤浅...",
+            file_path="downloads/20260729_翟东升看百年大变局/001_xxx.mp4",
+        )
+```
+
+### 9.6 统计输出
+
+合集下载完成后，会输出累计统计：
+
+```
+[4/4] 完成: 成功 3/19，跳过 16
+      保存目录: downloads/20260729_翟东升看百年大变局/
+      合集 7658437054228858923 累计已下载 19 个视频（含历史记录）
+```
+
+「跳过 16」表示这 16 个视频已在之前的运行中下载过，本次自动跳过。
+
+---
+
+## 10. 使用指南
+
+### 10.1 基本用法
 
 ```bash
 cd /Users/zhenxi/codes/python/douyinDL
@@ -496,7 +721,7 @@ export PATH="$HOME/.local/bin:$PATH"
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl "<分享链接或文本>" -o ./downloads
 ```
 
-### 8.2 参数说明
+### 10.2 参数说明
 
 | 参数 | 说明 | 默认值 |
 | ---- | ---- | ---- |
@@ -504,8 +729,10 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl "<分享链接或文本>" -o
 | `-o, --output` | 视频保存根目录 | `./downloads`（config.yaml 可改） |
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |
+| `-f, --force` | 强制重新下载，忽略进度数据库记录 | 关闭 |
+| `-m, --metadata` | 保存元数据（封面/文案/原声/JSON） | 关闭 |
 
-### 8.3 使用示例
+### 10.3 使用示例
 
 #### 示例 1：下载整个合集（直接粘贴分享文本）
 
@@ -550,7 +777,23 @@ dl = DouyinDownloader()  # 自动读取 config/config.yaml
 asyncio.run(dl.run("https://v.douyin.com/SlGTwuMq498/"))
 ```
 
-### 8.4 输出结构示例
+#### 示例 6：下载合集并保存元数据
+
+```bash
+# 加 -m 参数，每个视频旁会额外生成 .jpg/.txt/.mp3/.json
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/SlGTwuMq498/" -m
+```
+
+#### 示例 7：强制重新下载（忽略进度记录）
+
+```bash
+# 加 -f 参数，跳过进度数据库检查和文件存在检查，强制覆盖
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/SlGTwuMq498/" -f
+```
+
+### 10.4 输出结构示例
 
 ```
 downloads/
@@ -562,7 +805,7 @@ downloads/
 └── 20260729_用最好的动画讲解HBM原理.mp4      # 单视频（日期_文案）
 ```
 
-### 8.5 运行输出示例
+### 10.5 运行输出示例
 
 ```
 [1/3] 解析分享链接: https://v.douyin.com/SlGTwuMq498/
@@ -587,15 +830,15 @@ downloads/
 
 ---
 
-## 9. Skill 集成
+## 11. Skill 集成
 
-### 9.1 Skill 文件位置
+### 11.1 Skill 文件位置
 
 ```
 .trae/skills/douyin-download/SKILL.md
 ```
 
-### 9.2 Skill 定义要点
+### 11.2 Skill 定义要点
 
 ```markdown
 ---
@@ -606,7 +849,7 @@ description: "Downloads Douyin (抖音) videos or video collections from share l
 
 **description 字段必须包含触发条件**：使用 "Invoke when..." 句式，便于模型识别。
 
-### 9.3 Skill 调用流程
+### 11.3 Skill 调用流程
 
 1. 用户发送包含抖音链接的消息
 2. Trae IDE 匹配到 `douyin-download` skill 的触发条件
@@ -616,9 +859,9 @@ description: "Downloads Douyin (抖音) videos or video collections from share l
 
 ---
 
-## 10. 常见问题与排查
+## 12. 常见问题与排查
 
-### 10.1 `uv: command not found`
+### 12.1 `uv: command not found`
 
 **原因**：uv 未安装或未加入 PATH。
 
@@ -629,13 +872,13 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### 10.2 `'PostDetailFilter' object has no attribute '_to_list'`
+### 12.2 `'PostDetailFilter' object has no attribute '_to_list'`
 
 **原因**：f2 中 `PostDetailFilter` 只有 `_to_dict()` 方法（返回字典），没有 `_to_list()`。
 
 **解决**：单视频场景使用 `video._to_dict()` 而非 `video._to_list()`。本项目 v0.2.0 已修复。
 
-### 10.3 API 请求返回空数据或 401
+### 12.3 API 请求返回空数据或 401
 
 **可能原因**：
 
@@ -646,19 +889,19 @@ export PATH="$HOME/.local/bin:$PATH"
 3. **ttwid 失效**：极少发生，匿名 ttwid 通常长期有效
    - **解决**：重新运行即可，`build_cookie()` 每次生成新 token
 
-### 10.4 依赖版本冲突（httpx / rich）
+### 12.4 依赖版本冲突（httpx / rich）
 
 **原因**：f2 锁定了 `httpx==0.27.2` 和 `rich==13.9.3`，若 `pyproject.toml` 中显式声明其他版本会冲突。
 
 **解决**：从 `pyproject.toml` 的 `dependencies` 中移除 `httpx` 和 `rich`，让 f2 统一管理。
 
-### 10.5 Python 版本不兼容
+### 12.5 Python 版本不兼容
 
 **原因**：f2 依赖的 `pydantic-core` 在 Python 3.14 上尚未提供预编译 wheel。
 
 **解决**：`pyproject.toml` 中固定 `requires-python = ">=3.12,<3.14"`，并用 `uv python pin 3.12` 锁定版本。
 
-### 10.6 视频文案含特殊字符导致文件名异常
+### 12.6 视频文案含特殊字符导致文件名异常
 
 **原因**：抖音文案中可能包含 `#话题`、`@用户`、换行符等。
 
@@ -669,7 +912,7 @@ export PATH="$HOME/.local/bin:$PATH"
 - 合并多余下划线/空格
 - 限制长度为 60 字符（可配置）
 
-### 10.7 合集下载被抖音封 IP
+### 12.7 合集下载被抖音封 IP
 
 **原因**：频繁下载触发风控。
 
@@ -679,7 +922,7 @@ export PATH="$HOME/.local/bin:$PATH"
 - 可适当增大该值（如 90 或 120 秒）
 - 也可分批下载，用 `-n` 参数限制单次下载数量
 
-### 10.8 合集视频数量超过 20 个
+### 12.8 合集视频数量超过 20 个
 
 **原因**：单次 API 请求最多返回 20 条。
 
@@ -687,9 +930,9 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ---
 
-## 11. 后续扩展方向
+## 13. 后续扩展方向
 
-### 11.1 支持更多资源类型
+### 13.1 支持更多资源类型
 
 当前支持合集与单视频，可扩展支持：
 
@@ -698,25 +941,30 @@ export PATH="$HOME/.local/bin:$PATH"
 - 直播回放
 - 图集（图文作品）
 
-### 11.2 下载元数据
+### 13.2 下载元数据（v0.3.0 已实现）
 
-可额外保存：
+> 已在 v0.3.0 实现，详见 [第 8 章 元数据保存](#8-元数据保存)。
 
-- 视频封面（`cover` 字段）
-- 视频文案全文（`desc.txt`）
-- 原声 MP3（`music_play_url`）
-- 视频信息 JSON（aweme_id、create_time、stats 等）
+支持保存：
+- 视频封面（`cover` 字段 → `.jpg`）
+- 视频文案全文（`desc` → `.txt`）
+- 原声 MP3（`music_play_url` → `.mp3`）
+- 视频信息 JSON（完整字典 → `.json`）
 
-### 11.3 并发下载
+通过 `-m` 参数或 `config.yaml` 的 `save_metadata: true` 启用。
+
+### 13.3 并发下载
 
 当前为串行下载，可改为 `asyncio.gather` 并发下载（建议并发数 3-5，避免触发风控）。
 
-### 11.4 进度持久化
+### 13.4 进度持久化（v0.3.0 已实现）
 
-将已下载视频的 `aweme_id` 记录到本地数据库，支持：
+> 已在 v0.3.0 实现，详见 [第 9 章 进度持久化](#9-进度持久化)。
 
-- 跨会话断点续传
-- 增量下载（仅下载合集新增视频）
+基于 SQLite 记录已下载视频的 `aweme_id`，支持：
+- 断点续传（下载中断后重新运行，自动跳过已下载视频）
+- 增量下载（合集新增视频后，只下载新增部分）
+- `-f/--force` 参数可强制重新下载
 
 ---
 
@@ -730,6 +978,9 @@ export PATH="$HOME/.local/bin:$PATH"
 | 合集 API | `src/douyindl/downloader.py` | `fetch_mix_videos()` |
 | 单视频 API | `src/douyindl/downloader.py` | `fetch_one_video()` |
 | 视频下载 | `src/douyindl/downloader.py` | `download_video()` |
+| 小文件下载 | `src/douyindl/downloader.py` | `_download_simple()` |
+| 元数据保存 | `src/douyindl/downloader.py` | `download_metadata()` |
+| 进度数据库 | `src/douyindl/downloader.py` | `ProgressDB` |
 | 文件名清理 | `src/douyindl/downloader.py` | `_sanitize_filename()` |
 | 主流程 | `src/douyindl/downloader.py` | `DouyinDownloader.run()` |
 | CLI 入口 | `src/douyindl/downloader.py` | `main()` |
@@ -747,6 +998,19 @@ export PATH="$HOME/.local/bin:$PATH"
 | lxml | 最新 | f2 依赖 |
 
 ## 附录 C：版本变更记录
+
+### v0.3.0（2026-07-29）
+
+- 新增元数据保存功能（`-m` 参数或 `save_metadata` 配置）：
+  - 视频封面 `.jpg`、文案全文 `.txt`、原声 MP3 `.mp3`、完整信息 `.json`
+  - 子开关 `save_cover` / `save_desc` / `save_music` / `save_json` 独立控制
+- 新增进度持久化功能（基于 SQLite）：
+  - `ProgressDB` 类管理下载记录，支持断点续传与增量下载
+  - `-f/--force` 参数强制重新下载
+  - `enable_progress` 配置开关，`progress_db_path` 可自定义路径
+- 新增 `_download_simple()` 函数用于小文件下载（封面/原声）
+- `.gitignore` 新增忽略 `.douyindl/` 目录
+- 文档新增第 8 章「元数据保存」、第 9 章「进度持久化」
 
 ### v0.2.0（2026-07-29）
 
