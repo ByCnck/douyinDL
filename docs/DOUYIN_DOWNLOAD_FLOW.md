@@ -534,12 +534,30 @@ v0.3.0 新增元数据保存功能，在下载视频的同时可选择保存以�
 
 ### 8.2 启用方式
 
-**方式一：CLI 参数（单次生效）**
+**方式一：CLI 参数精细控制（单次生效，推荐）**
+
+`-m` 参数支持可选值，可精确指定要保存的元数据类型：
 
 ```bash
-# 下载时加 -m 参数，本次下载会保存元数据
+# 保存全部元数据（封面/文案/原声/JSON）
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl "https://v.douyin.com/xxx/" -m
+
+# 等同于上面的显式写法
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl "https://v.douyin.com/xxx/" -m all
+
+# 仅保存原声 MP3
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl "https://v.douyin.com/xxx/" -m music
+
+# 保存封面 + 原声（逗号分隔多个类型）
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl "https://v.douyin.com/xxx/" -m music,cover
+
+# 保存文案 + JSON
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl "https://v.douyin.com/xxx/" -m desc,json
 ```
+
+可选类型：`all` / `cover` / `desc` / `music` / `json`（不区分大小写）
+
+**CLI 参数优先级**：使用 `-m` 时会覆盖 config.yaml 中的所有元数据开关；未使用 `-m` 时沿用配置文件设置。
 
 **方式二：配置文件（永久生效）**
 
@@ -551,6 +569,8 @@ save_desc: true       # 文案
 save_music: true      # 原声
 save_json: true       # JSON
 ```
+
+适合需要长期保存某种元数据的场景（如每次都要原声）。
 
 ### 8.3 命名规则
 
@@ -730,7 +750,7 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl "<分享链接或文本>" -o
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |
 | `-f, --force` | 强制重新下载，忽略进度数据库记录 | 关闭 |
-| `-m, --metadata` | 保存元数据（封面/文案/原声/JSON） | 关闭 |
+| `-m [TYPES]`, `--metadata [TYPES]` | 保存元数据，可选 `all`/`cover`/`desc`/`music`/`json`（逗号分隔多个）；仅 `-m` 等同于 `all`；未指定时使用 config.yaml 设置 | 关闭 |
 
 ### 10.3 使用示例
 
@@ -777,15 +797,31 @@ dl = DouyinDownloader()  # 自动读取 config/config.yaml
 asyncio.run(dl.run("https://v.douyin.com/SlGTwuMq498/"))
 ```
 
-#### 示例 6：下载合集并保存元数据
+#### 示例 6：下载合集并保存全部元数据
 
 ```bash
-# 加 -m 参数，每个视频旁会额外生成 .jpg/.txt/.mp3/.json
+# 加 -m 参数（不带值），每个视频旁会额外生成 .jpg/.txt/.mp3/.json
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/SlGTwuMq498/" -m
 ```
 
-#### 示例 7：强制重新下载（忽略进度记录）
+#### 示例 7：仅下载原声 MP3（精细控制元数据类型）
+
+```bash
+# -m music 只保存原声，不保存封面/文案/JSON
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/SlGTwuMq498/" -m music
+```
+
+#### 示例 8：下载封面 + 原声（逗号分隔多个类型）
+
+```bash
+# -m music,cover 同时保存原声和封面
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/SlGTwuMq498/" -m music,cover
+```
+
+#### 示例 9：强制重新下载（忽略进度记录）
 
 ```bash
 # 加 -f 参数，跳过进度数据库检查和文件存在检查，强制覆盖
@@ -998,6 +1034,16 @@ export PATH="$HOME/.local/bin:$PATH"
 | lxml | 最新 | f2 依赖 |
 
 ## 附录 C：版本变更记录
+
+### v0.3.1（2026-07-29）
+
+- `-m` 参数支持精细控制元数据类型：
+  - `-m` 或 `-m all`：保存全部元数据（封面/文案/原声/JSON）
+  - `-m music`：仅保存原声 MP3
+  - `-m music,cover`：逗号分隔多个类型
+  - 可选类型：`all`/`cover`/`desc`/`music`/`json`（不区分大小写）
+- 使用 `-m` 时覆盖 config.yaml 中的元数据开关；未使用 `-m` 时沿用配置文件设置
+- 修复：移除 CLI 中残留的重复 `save_metadata` 设置逻辑
 
 ### v0.3.0（2026-07-29）
 

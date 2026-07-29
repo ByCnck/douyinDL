@@ -777,8 +777,9 @@ def main():
     )
     parser.add_argument(
         "-m", "--metadata",
-        action="store_true",
-        help="保存元数据（封面/文案/原声/JSON），覆盖 config.yaml 中的 save_metadata 设置",
+        nargs="?", const="all", default=None,
+        help="保存元数据，可选类型: all/cover/desc/music/json（逗号分隔多个）；"
+             "仅 -m 等同于 all；未指定时使用 config.yaml 中的 save_metadata 设置",
     )
     args = parser.parse_args()
 
@@ -793,9 +794,25 @@ def main():
     config_path = Path(args.config) if args.config else None
     config = Config(config_path)
 
-    # CLI 参数覆盖配置文件
-    if args.metadata:
+    # CLI -m 参数精细控制元数据子开关
+    # - 未指定 -m：沿用 config.yaml 设置
+    # - -m 或 -m all：开启全部元数据
+    # - -m music,cover：仅开启指定类型，其余关闭
+    if args.metadata is not None:
+        meta_types = args.metadata.lower()
+        meta_all = meta_types == "all"
+        # 解析逗号分隔的类型列表
+        wanted = set(t.strip() for t in meta_types.split(",") if t.strip())
+        valid = {"cover", "desc", "music", "json", "all"}
+        invalid = wanted - valid
+        if invalid:
+            print(f"错误: 未知的元数据类型 {invalid}，可选: {valid}", file=sys.stderr)
+            sys.exit(1)
         config.save_metadata = True
+        config.save_cover = meta_all or "cover" in wanted
+        config.save_desc = meta_all or "desc" in wanted
+        config.save_music = meta_all or "music" in wanted
+        config.save_json = meta_all or "json" in wanted
 
     dl = DouyinDownloader(
         output_dir=args.output,

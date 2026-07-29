@@ -43,7 +43,7 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl "<分享链接或文本>" -o
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |
 | `-f, --force` | 强制重新下载，忽略进度数据库记录 | 关闭 |
-| `-m, --metadata` | 保存元数据（封面/文案/原声/JSON） | 关闭 |
+| `-m [TYPES]`, `--metadata [TYPES]` | 保存元数据，可选 `all`/`cover`/`desc`/`music`/`json`（逗号分隔多个）；仅 `-m` 等同于 `all` | 关闭 |
 
 ### 示例
 
@@ -66,11 +66,19 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/SlGTwuMq498/" -c /path/to/config.yaml
 
-# 5. 下载合集并保存元数据（封面/文案/原声/JSON）
+# 5. 下载合集并保存全部元数据（封面/文案/原声/JSON）
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/SlGTwuMq498/" -m
 
-# 6. 强制重新下载（忽略进度记录，覆盖已有文件）
+# 6. 仅下载原声 MP3（精细控制元数据类型）
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/SlGTwuMq498/" -m music
+
+# 7. 下载封面 + 原声（逗号分隔多个类型）
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
+  "https://v.douyin.com/SlGTwuMq498/" -m music,cover
+
+# 8. 强制重新下载（忽略进度记录，覆盖已有文件）
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/SlGTwuMq498/" -f
 ```
