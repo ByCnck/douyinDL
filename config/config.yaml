@@ -1,0 +1,48 @@
+# 抖音视频/合集下载工具配置文件
+# 路径: config/config.yaml
+# 说明: 所有运行参数集中在此文件管理，修改后无需改动代码
+
+# ── HTTP 请求相关 ──────────────────────────────────────────────
+
+# User-Agent：必须与 f2/conf/conf.yaml 中的 UA 保持一致，否则 a_bogus 签名校验失败
+user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+
+# HTTP 请求超时（秒）
+timeout: 15
+
+# API 请求最大重试次数
+max_retries: 5
+
+# 最大并发任务数（f2 crawler 内部信号量）
+max_tasks: 1
+
+# 最大连接数（httpx 连接池）
+max_connections: 5
+
+
+# ── 抖音 API 调用相关 ─────────────────────────────────────────
+
+# 合集 API 分页每页条数（不建议超过 20，可能触发风控）
+page_counts: 10
+
+# API 分页请求间隔（秒），避免抖音风控
+api_request_interval: 2.0
+
+
+# ── 视频下载相关 ──────────────────────────────────────────────
+
+# 合集内视频下载间隔（秒），合集场景使用，单视频无需等待
+# 用户要求合集间隔 60 秒
+mix_download_interval: 60
+
+# 流式下载 chunk 大小（字节），默认 64KB
+chunk_size: 65536
+
+# 下载文件名最大长度（字符）
+filename_max_len: 60
+
+
+# ── 输出目录相关 ──────────────────────────────────────────────
+
+# 默认输出根目录（CLI -o 参数可覆盖）
+output_dir: "./downloads"
