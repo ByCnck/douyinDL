@@ -235,6 +235,8 @@ async def fetch_mix_videos(
 
     Returns:
         (合集名, 视频信息字典列表)
+        每个字典除 filter 返回的字段外，额外补充 _meta 子字典（duration/width/height/
+        file_size/bit_rate/fps/ratio/video_format/is_h265 等视频元数据）
     """
     cookie = build_cookie()
     kwargs = build_crawler_kwargs(cookie, config)
@@ -261,6 +263,11 @@ async def fetch_mix_videos(
         if not page_items:
             break
 
+        # 从原始响应提取每个视频的元数据，补充到 filter 返回的字典中
+        aweme_list = response.get("aweme_list", []) if isinstance(response, dict) else []
+        for item, aweme in zip(page_items, aweme_list):
+            item["_meta"] = _extract_video_meta(aweme)
+
         collected.extend(page_items)
         cursor = mix.max_cursor or 0
 
@@ -280,6 +287,9 @@ async def fetch_one_video(aweme_id: str, config: Config) -> Dict[str, Any]:
 
     注意：PostDetailFilter 只有 _to_dict() 方法（返回字典），
     没有 _to_list()，与 UserMixFilter 不同。
+
+    返回的字典额外包含 _meta 子字典（duration/width/height/file_size/
+    bit_rate/fps/ratio/video_format/is_h265 等视频元数据）。
     """
     cookie = build_cookie()
     kwargs = build_crawler_kwargs(cookie, config)
@@ -293,7 +303,68 @@ async def fetch_one_video(aweme_id: str, config: Config) -> Dict[str, Any]:
     item = video._to_dict()
     if not item:
         raise ValueError(f"未获取到视频信息，aweme_id={aweme_id}")
+
+    # 从原始响应提取视频元数据
+    aweme_detail = response.get("aweme_detail", {}) if isinstance(response, dict) else {}
+    item["_meta"] = _extract_video_meta(aweme_detail)
     return item
+
+
+def _extract_video_meta(aweme: Dict[str, Any]) -> Dict[str, Any]:
+    """从 API 原始响应的单个 aweme 节点提取视频元数据。
+
+    f2 的 filter 会丢失 video 对象下的 width/height/data_size 等嵌套字段，
+    此函数从原始 JSON 中补充提取，用于写入进度数据库。
+
+    Args:
+        aweme: 原始响应中的 aweme_detail 或 aweme_list[i] 节点
+
+    Returns:
+        包含视频元数据的字典，字段缺失时为 None
+    """
+    if not aweme or not isinstance(aweme, dict):
+        return {}
+
+    video = aweme.get("video") or {}
+    # bit_rate 是列表，取第一个清晰度档位
+    bit_rate_list = video.get("bit_rate") or []
+    br0 = bit_rate_list[0] if bit_rate_list and len(bit_rate_list) > 0 else {}
+    play_addr = br0.get("play_addr") or {}
+
+    # 统计字段在 aweme 根节点下的 statistics
+    stats = aweme.get("statistics") or {}
+
+    # 作者昵称在 author 字段下
+    author = aweme.get("author") or {}
+
+    # create_time 是 UNIX 时间戳（秒），转字符串
+    create_ts = aweme.get("create_time")
+    create_time_str = ""
+    if create_ts and isinstance(create_ts, (int, float)):
+        try:
+            create_time_str = datetime.fromtimestamp(
+                int(create_ts), tz=datetime.now().astimezone().tzinfo
+            ).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OSError):
+            create_time_str = ""
+
+    return {
+        "duration": video.get("duration"),          # 毫秒
+        "width": video.get("width"),                # 像素
+        "height": video.get("height"),              # 像素
+        "file_size": play_addr.get("data_size"),    # 字节
+        "bit_rate": br0.get("bit_rate"),            # bps
+        "fps": br0.get("FPS"),                      # 帧率
+        "ratio": video.get("ratio"),                # 分辨率标识，如 "2160p"
+        "video_format": video.get("format"),        # 格式，如 "mp4"
+        "is_h265": 1 if br0.get("is_h265") else 0,  # 0/1
+        "nickname": author.get("nickname"),         # 作者昵称
+        "digg_count": stats.get("digg_count"),      # 点赞数
+        "comment_count": stats.get("comment_count"),# 评论数
+        "share_count": stats.get("share_count"),    # 分享数
+        "collect_count": stats.get("collect_count"),# 收藏数
+        "create_time": create_time_str,             # 创建时间字符串
+    }
 
 
 # ── 视频下载 ────────────────────────────────────────────────────
@@ -473,6 +544,23 @@ class ProgressDB:
             mix_name        TEXT,              -- 合集名（单视频为 NULL）
             desc            TEXT,              -- 视频文案
             file_path       TEXT,              -- 保存路径
+            -- 视频元数据（从 API 原始响应提取，v0.4.0 新增）
+            duration        INTEGER,           -- 视频时长（毫秒）
+            width           INTEGER,           -- 视频宽度（像素）
+            height          INTEGER,           -- 视频高度（像素）
+            file_size       INTEGER,           -- 文件大小（字节，来自 API）
+            bit_rate        INTEGER,           -- 视频码率（bps）
+            fps             REAL,              -- 帧率
+            ratio           TEXT,              -- 分辨率标识（如 2160p）
+            video_format    TEXT,             -- 视频格式（如 mp4）
+            is_h265         INTEGER,           -- 是否 H.265 编码（0/1）
+            -- 作者与统计信息（v0.4.0 新增）
+            nickname        TEXT,              -- 作者昵称
+            digg_count      INTEGER,           -- 点赞数
+            comment_count   INTEGER,           -- 评论数
+            share_count     INTEGER,           -- 分享数
+            collect_count   INTEGER,           -- 收藏数
+            create_time     TEXT,              -- 视频创建时间
             downloaded_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
 
@@ -480,7 +568,8 @@ class ProgressDB:
         with ProgressDB(Path(".douyindl/progress.db")) as db:
             if db.is_downloaded("123456"):
                 print("已下载")
-            db.record("123456", "mix", "mix_id_xxx", "合集名", "文案", "/path/to.mp4")
+            db.record("123456", "mix", "mix_id_xxx", "合集名", "文案", "/path/to.mp4",
+                      duration=1004667, width=3840, height=2160, file_size=159833966, ...)
     """
 
     def __init__(self, db_path: Path):
@@ -490,6 +579,18 @@ class ProgressDB:
     def __enter__(self) -> "ProgressDB":
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
+        self._migrate_schema()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    def _migrate_schema(self) -> None:
+        """建表并对旧版数据库做列迁移（ALTER TABLE ADD COLUMN）。"""
+        if not self._conn:
+            return
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS downloaded_videos (
                 aweme_id        TEXT PRIMARY KEY,
@@ -501,17 +602,39 @@ class ProgressDB:
                 downloaded_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # v0.4.0 新增字段：通过 PRAGMA 检测列是否存在，缺失则 ALTER TABLE 补齐
+        # 旧数据库（v0.3.0）只有 7 个字段，此处自动补齐新字段，保留历史记录
+        existing_cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(downloaded_videos)")
+        }
+        new_cols = {
+            "duration": "INTEGER",
+            "width": "INTEGER",
+            "height": "INTEGER",
+            "file_size": "INTEGER",
+            "bit_rate": "INTEGER",
+            "fps": "REAL",
+            "ratio": "TEXT",
+            "video_format": "TEXT",
+            "is_h265": "INTEGER",
+            "nickname": "TEXT",
+            "digg_count": "INTEGER",
+            "comment_count": "INTEGER",
+            "share_count": "INTEGER",
+            "collect_count": "INTEGER",
+            "create_time": "TEXT",
+        }
+        for col, col_type in new_cols.items():
+            if col not in existing_cols:
+                self._conn.execute(
+                    f"ALTER TABLE downloaded_videos ADD COLUMN {col} {col_type}"
+                )
         # 为 resource_id 建索引，加速合集场景下查询已下载视频
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_resource_id ON downloaded_videos(resource_id)"
         )
         self._conn.commit()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self._conn:
-            self._conn.close()
-            self._conn = None
 
     def is_downloaded(self, aweme_id: str) -> bool:
         """查询某视频是否已记录为下载成功。
@@ -534,23 +657,67 @@ class ProgressDB:
         mix_name: str,
         desc: str,
         file_path: str,
+        meta: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """记录一条下载成功记录（已存在则更新）。"""
+        """记录一条下载成功记录（已存在则更新）。
+
+        Args:
+            meta: 视频元数据字典，可包含 duration/width/height/file_size/
+                  bit_rate/fps/ratio/video_format/is_h265/nickname/
+                  digg_count/comment_count/share_count/collect_count/create_time
+                  缺失字段写 NULL
+        """
         if not self._conn:
             return
+        meta = meta or {}
         self._conn.execute(
             """INSERT INTO downloaded_videos
-               (aweme_id, resource_type, resource_id, mix_name, desc, file_path)
-               VALUES (?, ?, ?, ?, ?, ?)
+               (aweme_id, resource_type, resource_id, mix_name, desc, file_path,
+                duration, width, height, file_size, bit_rate, fps, ratio,
+                video_format, is_h265, nickname, digg_count, comment_count,
+                share_count, collect_count, create_time)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(aweme_id) DO UPDATE SET
                    resource_type=excluded.resource_type,
                    resource_id=excluded.resource_id,
                    mix_name=excluded.mix_name,
                    desc=excluded.desc,
                    file_path=excluded.file_path,
+                   duration=excluded.duration,
+                   width=excluded.width,
+                   height=excluded.height,
+                   file_size=excluded.file_size,
+                   bit_rate=excluded.bit_rate,
+                   fps=excluded.fps,
+                   ratio=excluded.ratio,
+                   video_format=excluded.video_format,
+                   is_h265=excluded.is_h265,
+                   nickname=excluded.nickname,
+                   digg_count=excluded.digg_count,
+                   comment_count=excluded.comment_count,
+                   share_count=excluded.share_count,
+                   collect_count=excluded.collect_count,
+                   create_time=excluded.create_time,
                    downloaded_at=CURRENT_TIMESTAMP
             """,
-            (aweme_id, resource_type, resource_id, mix_name, desc, file_path),
+            (
+                aweme_id, resource_type, resource_id, mix_name, desc, file_path,
+                meta.get("duration"),
+                meta.get("width"),
+                meta.get("height"),
+                meta.get("file_size"),
+                meta.get("bit_rate"),
+                meta.get("fps"),
+                meta.get("ratio"),
+                meta.get("video_format"),
+                meta.get("is_h265"),
+                meta.get("nickname"),
+                meta.get("digg_count"),
+                meta.get("comment_count"),
+                meta.get("share_count"),
+                meta.get("collect_count"),
+                meta.get("create_time"),
+            ),
         )
         self._conn.commit()
 
@@ -701,13 +868,35 @@ class DouyinDownloader:
                     await download_video(play_addr, save_path, cfg)
                     success += 1
 
+                    # 打印视频元数据（从 API 响应提取）
+                    meta = v.get("_meta") or {}
+                    if meta:
+                        dur = meta.get("duration") or 0
+                        w = meta.get("width") or 0
+                        h = meta.get("height") or 0
+                        size = meta.get("file_size") or 0
+                        # 时长转秒，文件大小转 MB
+                        info_parts = []
+                        if dur:
+                            info_parts.append(f"时长 {dur/1000:.1f}s")
+                        if w and h:
+                            info_parts.append(f"分辨率 {w}x{h}")
+                        if size:
+                            info_parts.append(f"大小 {size/1024/1024:.1f}MB")
+                        if meta.get("ratio"):
+                            info_parts.append(meta["ratio"])
+                        if meta.get("is_h265"):
+                            info_parts.append("H.265")
+                        if info_parts:
+                            print(f"      元数据: {', '.join(info_parts)}")
+
                     # 下载元数据（封面/文案/原声/JSON）
                     if cfg.save_metadata:
                         # base_path 不含扩展名，用于生成 .jpg/.txt/.mp3/.json
                         base_path = save_path.with_suffix("")
                         await download_metadata(v, base_path, cfg)
 
-                    # 记录到进度数据库
+                    # 记录到进度数据库（含视频元数据）
                     if progress_db:
                         progress_db.record(
                             aweme_id=str(aweme_id),
@@ -716,6 +905,7 @@ class DouyinDownloader:
                             mix_name=mix_name,
                             desc=desc[:200],
                             file_path=str(save_path),
+                            meta=v.get("_meta"),
                         )
                 except Exception as e:
                     print(f"      下载失败: {e}")
