@@ -768,7 +768,7 @@ class DouyinDownloader:
             db_path = Path.cwd() / db_path
         return ProgressDB(db_path)
 
-    async def run(self, share_url: str) -> List[Dict[str, Any]]:
+    async def run(self, share_url: str) -> Dict[str, Any]:
         """主入口：解析链接 → 获取视频列表 → 下载。
 
         命名规则：
@@ -784,7 +784,7 @@ class DouyinDownloader:
         - 每个视频旁额外生成 .jpg/.txt/.mp3/.json
 
         Returns:
-            已下载视频的信息列表
+            统计字典，含 url/kind/resource_id/mix_name/total/success/skipped/target_dir
         """
         cfg = self.config
         # 下载当日日期，用于目录名 / 单视频文件名前缀
@@ -921,7 +921,16 @@ class DouyinDownloader:
         if progress_db and kind == "mix":
             total = progress_db.count_by_resource(resource_id)
             print(f"      合集 {resource_id} 累计已下载 {total} 个视频（含历史记录）")
-        return videos
+        return {
+            "url": share_url,
+            "kind": kind,
+            "resource_id": resource_id,
+            "mix_name": mix_name,
+            "total": len(videos),
+            "success": success,
+            "skipped": skipped,
+            "target_dir": str(target_dir),
+        }
 
 
 class _NullContext:
@@ -1014,10 +1023,48 @@ def main():
 
     # 多链接串行下载（asyncio.run 只能调用一次，包一层协程循环）
     async def run_all() -> None:
+        total = len(urls)
+        results: List[Dict[str, Any]] = []
         for i, url in enumerate(urls, 1):
-            if len(urls) > 1:
-                print(f"\n========== [{i}/{len(urls)}] {url} ==========")
-            await dl.run(url)
+            if total > 1:
+                print(f"\n========== [{i}/{total}] {url} ==========")
+            try:
+                stat = await dl.run(url)
+                results.append(stat)
+            except Exception as e:
+                # 单个链接失败不中断后续链接
+                print(f"      下载失败: {e}", file=sys.stderr)
+                results.append({
+                    "url": url, "kind": "", "resource_id": "", "mix_name": "",
+                    "total": 0, "success": 0, "skipped": 0, "target_dir": "",
+                    "error": str(e),
+                })
+            # 多链接之间等待间隔，防止风控（复用 mix_download_interval，最后一个不等待）
+            if i < total and config.mix_download_interval > 0:
+                print(f"\n等待 {config.mix_download_interval} 秒后继续下载下一个链接...")
+                await asyncio.sleep(config.mix_download_interval)
+
+        # 多链接下载总结
+        if total > 1:
+            sum_success = sum(r.get("success", 0) for r in results)
+            sum_skipped = sum(r.get("skipped", 0) for r in results)
+            sum_total = sum(r.get("total", 0) for r in results)
+            failed_links = [r["url"] for r in results if r.get("error")]
+            print("\n========== 多链接下载总结 ==========")
+            for i, r in enumerate(results, 1):
+                kind_label = "合集" if r.get("kind") == "mix" else (
+                    "单视频" if r.get("kind") == "one" else "失败"
+                )
+                name = r.get("mix_name") or r.get("resource_id") or r.get("error", "")
+                status = f"成功 {r.get('success', 0)}/{r.get('total', 0)}，跳过 {r.get('skipped', 0)}"
+                if r.get("error"):
+                    status = f"失败: {r['error']}"
+                print(f"  [{i}/{total}] {kind_label} {name} - {status}")
+            print(f"  合计: 成功 {sum_success}/{sum_total}，跳过 {sum_skipped}", end="")
+            if failed_links:
+                print(f"，失败 {len(failed_links)} 个链接")
+            else:
+                print()
 
     asyncio.run(run_all())
 
