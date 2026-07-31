@@ -41,13 +41,13 @@ uv run python -m douyindl "<链接>" -c /path/to/custom-config.yaml
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `mix_download_interval` | int | 60 | 合集内视频下载间隔（秒），防封 IP；单视频无需等待 |
+| `mix_download_interval` | int | 60 | 合集内视频下载间隔基准值（秒），实际等待在 `base*0.9` 到 `base` 之间随机取数，防封 IP；单视频无需等待 |
 | `chunk_size` | int | 65536 | 流式下载 chunk 大小（字节），默认 64KB |
 | `filename_max_len` | int | 60 | 下载文件名最大长度（字符），超长截断 |
 | `download_max_retries` | int | 3 | 下载失败时的最大重试次数（不含首次下载），0 表示不重试 |
 | `download_retry_interval` | float | 5.0 | 下载重试间隔（秒），失败后等待多久再重试 |
 
-> `mix_download_interval` 是用户明确要求的 60 秒间隔，避免频繁下载合集导致 IP 封禁。
+> `mix_download_interval` 是间隔基准值，实际等待时间在 `base*0.9` 到 `base` 之间随机取数（如 60 秒基准值实际等待 54-60 秒），避免固定间隔被风控识别。该间隔用于合集内视频之间、多链接之间、失败重试记录之间。
 > `download_max_retries` 控制单个视频下载失败后的自动重试次数，重试间隔由 `download_retry_interval` 控制。无论成功失败都会记录到数据库，失败记录可通过 `-r/--retry-failed` 重新下载。
 
 ### 元数据保存

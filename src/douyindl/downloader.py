@@ -15,6 +15,7 @@
 
 import asyncio
 import json
+import random
 import re
 import sqlite3
 import sys
@@ -374,6 +375,23 @@ def _extract_video_meta(aweme: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ── 视频下载 ────────────────────────────────────────────────────
+
+def _random_interval(base: float) -> float:
+    """在 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别。
+
+    用于合集视频下载间隔、多链接间隔、失败重试间隔等场景，
+    将固定间隔改为随机区间，降低被抖音风控识别的概率。
+
+    Args:
+        base: 基础间隔秒数（如 config.mix_download_interval）
+
+    Returns:
+        随机间隔秒数，范围 [base*0.9, base]；base<=0 时返回 0
+    """
+    if base <= 0:
+        return 0
+    return random.uniform(base * 0.9, base)
+
 
 def _sanitize_filename(name: str, max_len: int = 60) -> str:
     """清理文件名中的非法字符，去除 #话题 标签。"""
@@ -989,9 +1007,11 @@ class DouyinDownloader:
                     )
 
                 # 失败记录之间也等待间隔，避免风控（最后一个不等待）
+                # 间隔时间在 base*0.9 到 base 之间随机取数
                 if i < total and cfg.mix_download_interval > 0:
-                    print(f"      等待 {cfg.mix_download_interval} 秒后继续...")
-                    await asyncio.sleep(cfg.mix_download_interval)
+                    actual_interval = _random_interval(cfg.mix_download_interval)
+                    print(f"      等待 {actual_interval:.1f} 秒后继续...")
+                    await asyncio.sleep(actual_interval)
 
         print(f"\n[retry-failed] 完成: 成功 {success}/{total}，仍失败 {still_failed}")
         return {
@@ -1164,9 +1184,11 @@ class DouyinDownloader:
                         )
 
                 # 合集场景：视频间间隔等待（最后一个不需要）
+                # 间隔时间在 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别
                 if download_interval and i < len(videos):
-                    print(f"      等待 {download_interval} 秒后继续下载下一个...")
-                    await asyncio.sleep(download_interval)
+                    actual_interval = _random_interval(download_interval)
+                    print(f"      等待 {actual_interval:.1f} 秒后继续下载下一个...")
+                    await asyncio.sleep(actual_interval)
 
         # 统计输出
         print(f"\n[4/4] 完成: 成功 {success}/{len(videos)}，跳过 {skipped}")
@@ -1349,9 +1371,11 @@ def main():
                     "error": str(e),
                 })
             # 多链接之间等待间隔，防止风控（复用 mix_download_interval，最后一个不等待）
+            # 间隔时间在 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别
             if i < total and config.mix_download_interval > 0:
-                print(f"\n等待 {config.mix_download_interval} 秒后继续下载下一个链接...")
-                await asyncio.sleep(config.mix_download_interval)
+                actual_interval = _random_interval(config.mix_download_interval)
+                print(f"\n等待 {actual_interval:.1f} 秒后继续下载下一个链接...")
+                await asyncio.sleep(actual_interval)
 
         # 多链接下载总结
         if total > 1:

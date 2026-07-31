@@ -9,7 +9,7 @@ description: "Downloads Douyin (抖音) videos or video collections from share l
 
 接收抖音分享链接（短链、合集、单视频均可），自动解析真实 URL，提取合集内全部视频列表（序号 + 标题 + 下载地址），并下载无水印 MP4 文件。
 
-- **合集**：创建子目录 `YYYYMMDD_合集名/`，视频间间隔 60 秒下载（防封 IP），文件名 `001_文案.mp4`
+- **合集**：创建子目录 `YYYYMMDD_合集名/`，视频间间隔 54-60 秒随机下载（防封 IP），文件名 `001_文案.mp4`
 - **单视频**：直接下载到输出目录，文件名 `YYYYMMDD_文案.mp4`
 - **配置化**：UA、chunk 大小、间隔时间等参数集中在 `config/config.yaml`
 - **元数据保存**：可选下载封面/文案/原声/JSON（`-m` 或配置 `save_metadata: true`）
@@ -129,7 +129,7 @@ downloads/
 | `timeout` | HTTP 超时（秒） | 15 |
 | `page_counts` | 合集 API 每页条数 | 20 |
 | `api_request_interval` | API 分页请求间隔（秒） | 2.0 |
-| `mix_download_interval` | 合集视频下载间隔（秒，防封 IP） | 60 |
+| `mix_download_interval` | 合集视频下载间隔基准值（秒，实际 54-60 随机，防封 IP） | 60 |
 | `chunk_size` | 流式下载 chunk 大小（字节） | 65536 |
 | `filename_max_len` | 文件名最大长度 | 60 |
 | `download_max_retries` | 下载失败重试次数（不含首次，0 不重试） | 3 |
@@ -152,6 +152,6 @@ downloads/
 - **无需登录**：使用匿名 ttwid 即可访问合集 API，无需提供登录 cookie
 - **代理禁用**：运行时必须设置 `NO_PROXY='*'`，否则环境代理变量会干扰抖音请求
 - **Python 版本**：项目固定 `requires-python = ">=3.12,<3.14"`（f2 的 pydantic-core 依赖不支持 3.14）
-- **风控策略**：合集下载每视频间隔 60 秒（可在 config.yaml 调整），API 分页间隔 2 秒
+- **风控策略**：合集下载每视频间隔 54-60 秒随机（基准值 60，可在 config.yaml 调整），API 分页间隔 2 秒
 - **文件命名**：合集内 `001_文案.mp4`，单视频 `YYYYMMDD_文案.mp4`，自动去除 #话题标签
 - **断点续传**：已存在的文件会自动跳过

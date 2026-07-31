@@ -45,7 +45,7 @@ uv sync
 
 **解决**：
 
-- 合集内视频间默认间隔 60 秒（`mix_download_interval`），不要调低
+- 合集内视频间默认间隔 54-60 秒随机（`mix_download_interval` 基准值 60，实际等待 base*0.9 到 base 之间），不要调低
 - API 分页间隔默认 2 秒（`api_request_interval`），不要调低
 - 被封后等待一段时间再试，或更换网络环境
 
@@ -126,6 +126,7 @@ uv run python -m douyindl "<链接>" -m
 | 文档拆分 | 单文件拆为 7 个主题文档 + README 索引 |
 | 文件读取链接 | 新增 `-i/--input-file` 参数，从文件读取链接，下载后清空文件 |
 | 失败重试 | 下载失败自动重试 N 次；无论成功失败都记录到 db；新增 `-r/--retry-failed` 重试失败记录 |
+| 随机间隔 | 下载间隔改为 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别 |
 
 ## 文档导航
 
