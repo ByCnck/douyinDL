@@ -58,6 +58,8 @@ class Config:
     mix_download_interval: int
     chunk_size: int
     filename_max_len: int
+    download_max_retries: int
+    download_retry_interval: float
 
     # 元数据保存
     save_metadata: bool
@@ -98,6 +100,10 @@ class Config:
         self.mix_download_interval = int(data.get("mix_download_interval", 60))
         self.chunk_size = int(data.get("chunk_size", 65536))
         self.filename_max_len = int(data.get("filename_max_len", 60))
+        # 下载失败时的最大重试次数（不含首次下载），0 表示不重试
+        self.download_max_retries = int(data.get("download_max_retries", 3))
+        # 下载重试间隔（秒），失败后等待多久再重试
+        self.download_retry_interval = float(data.get("download_retry_interval", 5.0))
 
         # 元数据保存：总开关默认关闭，子开关默认开启
         self.save_metadata = bool(data.get("save_metadata", False))
@@ -561,15 +567,21 @@ class ProgressDB:
             share_count     INTEGER,           -- 分享数
             collect_count   INTEGER,           -- 收藏数
             create_time     TEXT,              -- 视频创建时间
+            -- 下载状态（v0.5.0 新增，无论成功失败都记录）
+            status          TEXT DEFAULT 'success',  -- 下载状态：success / failed
+            error_msg       TEXT,                    -- 失败时的错误信息（成功时为 NULL）
+            retry_count     INTEGER DEFAULT 0,       -- 已重试次数（不含首次）
             downloaded_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
 
     用法:
         with ProgressDB(Path(".douyindl/progress.db")) as db:
-            if db.is_downloaded("123456"):
-                print("已下载")
+            if db.is_success_downloaded("123456"):
+                print("已下载成功")
             db.record("123456", "mix", "mix_id_xxx", "合集名", "文案", "/path/to.mp4",
-                      duration=1004667, width=3840, height=2160, file_size=159833966, ...)
+                      status="success", meta={...})
+            for row in db.query_failed():
+                ...
     """
 
     def __init__(self, db_path: Path):
@@ -624,6 +636,11 @@ class ProgressDB:
             "share_count": "INTEGER",
             "collect_count": "INTEGER",
             "create_time": "TEXT",
+            # v0.5.0 新增：下载状态字段，无论成功失败都记录
+            # 旧数据库中已有记录视为成功（status='success'），error_msg=NULL，retry_count=0
+            "status": "TEXT DEFAULT 'success'",
+            "error_msg": "TEXT",
+            "retry_count": "INTEGER DEFAULT 0",
         }
         for col, col_type in new_cols.items():
             if col not in existing_cols:
@@ -634,20 +651,28 @@ class ProgressDB:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_resource_id ON downloaded_videos(resource_id)"
         )
+        # 为 status 建索引，加速 --retry-failed 查询失败记录
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_status ON downloaded_videos(status)"
+        )
         self._conn.commit()
 
-    def is_downloaded(self, aweme_id: str) -> bool:
+    def is_success_downloaded(self, aweme_id: str) -> bool:
         """查询某视频是否已记录为下载成功。
 
-        注意：仅检查数据库记录是否存在，不验证文件是否还在磁盘上。
-        文件存在性由调用方在跳过逻辑中额外判断。
+        仅当 status='success' 时返回 True，失败记录不跳过会重新下载。
+        注意：不验证文件是否还在磁盘上，文件存在性由调用方额外判断。
         """
         if not self._conn:
             return False
         cur = self._conn.execute(
-            "SELECT 1 FROM downloaded_videos WHERE aweme_id = ?", (aweme_id,)
+            "SELECT 1 FROM downloaded_videos WHERE aweme_id = ? AND status = 'success'",
+            (aweme_id,),
         )
         return cur.fetchone() is not None
+
+    # 兼容旧调用方的别名（内部已改用 is_success_downloaded）
+    is_downloaded = is_success_downloaded
 
     def record(
         self,
@@ -658,14 +683,20 @@ class ProgressDB:
         desc: str,
         file_path: str,
         meta: Optional[Dict[str, Any]] = None,
+        status: str = "success",
+        error_msg: Optional[str] = None,
+        retry_count: int = 0,
     ) -> None:
-        """记录一条下载成功记录（已存在则更新）。
+        """记录一条下载记录（已存在则更新），无论成功失败都记录。
 
         Args:
             meta: 视频元数据字典，可包含 duration/width/height/file_size/
                   bit_rate/fps/ratio/video_format/is_h265/nickname/
                   digg_count/comment_count/share_count/collect_count/create_time
                   缺失字段写 NULL
+            status: 下载状态，'success' 或 'failed'
+            error_msg: 失败时的错误信息（成功时传 None）
+            retry_count: 已重试次数（不含首次下载，0 表示首次即成功/失败）
         """
         if not self._conn:
             return
@@ -675,8 +706,9 @@ class ProgressDB:
                (aweme_id, resource_type, resource_id, mix_name, desc, file_path,
                 duration, width, height, file_size, bit_rate, fps, ratio,
                 video_format, is_h265, nickname, digg_count, comment_count,
-                share_count, collect_count, create_time)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                share_count, collect_count, create_time,
+                status, error_msg, retry_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(aweme_id) DO UPDATE SET
                    resource_type=excluded.resource_type,
                    resource_id=excluded.resource_id,
@@ -698,6 +730,9 @@ class ProgressDB:
                    share_count=excluded.share_count,
                    collect_count=excluded.collect_count,
                    create_time=excluded.create_time,
+                   status=excluded.status,
+                   error_msg=excluded.error_msg,
+                   retry_count=excluded.retry_count,
                    downloaded_at=CURRENT_TIMESTAMP
             """,
             (
@@ -717,16 +752,36 @@ class ProgressDB:
                 meta.get("share_count"),
                 meta.get("collect_count"),
                 meta.get("create_time"),
+                status,
+                error_msg,
+                retry_count,
             ),
         )
         self._conn.commit()
 
+    def query_failed(self) -> List[Dict[str, Any]]:
+        """查询所有下载失败的记录（status='failed'），用于 --retry-failed 重试。
+
+        返回字典列表，每个字典包含 aweme_id/resource_type/resource_id/mix_name/
+        desc/file_path/error_msg/retry_count 等字段。
+        """
+        if not self._conn:
+            return []
+        cur = self._conn.execute(
+            """SELECT aweme_id, resource_type, resource_id, mix_name, desc,
+                      file_path, error_msg, retry_count
+               FROM downloaded_videos WHERE status = 'failed'
+               ORDER BY downloaded_at"""
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
     def count_by_resource(self, resource_id: str) -> int:
-        """统计某合集/单视频已下载的视频数。"""
+        """统计某合集/单视频已下载成功的视频数（仅含 status='success'）。"""
         if not self._conn:
             return 0
         cur = self._conn.execute(
-            "SELECT COUNT(*) FROM downloaded_videos WHERE resource_id = ?",
+            "SELECT COUNT(*) FROM downloaded_videos WHERE resource_id = ? AND status = 'success'",
             (resource_id,),
         )
         return cur.fetchone()[0]
@@ -767,6 +822,183 @@ class DouyinDownloader:
         if not db_path.is_absolute():
             db_path = Path.cwd() / db_path
         return ProgressDB(db_path)
+
+    async def _download_with_retry(
+        self,
+        play_addr: str,
+        save_path: Path,
+    ) -> Tuple[bool, str, int]:
+        """带重试的下载，返回 (是否成功, 错误信息, 重试次数)。
+
+        重试次数由 config.download_max_retries 控制（0 表示不重试），
+        重试间隔由 config.download_retry_interval 控制。
+        retry_count 语义：0=首次即成功/失败，N=重试 N 次后成功/失败。
+        """
+        cfg = self.config
+        attempt = 0
+        last_error = ""
+        max_attempts = 1 + cfg.download_max_retries  # 首次 + 重试次数
+        for attempt in range(max_attempts):
+            try:
+                await download_video(play_addr, save_path, cfg)
+                return True, "", attempt
+            except Exception as e:
+                last_error = str(e)
+                if attempt < cfg.download_max_retries:
+                    print(f"      下载失败（第{attempt+1}次尝试），"
+                          f"{cfg.download_retry_interval}秒后重试: {e}")
+                    await asyncio.sleep(cfg.download_retry_interval)
+                else:
+                    print(f"      下载失败（共尝试{max_attempts}次，"
+                          f"已用尽重试次数）: {e}")
+        return False, last_error, attempt
+
+    async def retry_failed(self) -> Dict[str, Any]:
+        """重试数据库中所有下载失败的记录（status='failed'）。
+
+        流程：
+        1. 从 db 查询所有失败记录
+        2. 对每条记录用 aweme_id 调用 fetch_one_video 获取最新下载地址
+        3. 下载到原 file_path（带重试）
+        4. 更新 db 记录（成功则 status='success'，失败则刷新 error_msg/retry_count）
+
+        Returns:
+            统计字典，含 total/success/still_failed
+        """
+        cfg = self.config
+        print("[retry-failed] 开始重试数据库中的失败记录...")
+
+        db = self._get_progress_db()
+        if db is None:
+            print("错误: 进度数据库未启用，无法查询失败记录", file=sys.stderr)
+            return {"total": 0, "success": 0, "still_failed": 0}
+
+        with db as progress_db:
+            failed_list = progress_db.query_failed()
+
+        if not failed_list:
+            print("没有失败记录需要重试")
+            return {"total": 0, "success": 0, "still_failed": 0}
+
+        total = len(failed_list)
+        print(f"共 {total} 条失败记录需要重试:")
+        for i, r in enumerate(failed_list, 1):
+            desc_short = (r.get("desc") or "").replace("\n", " ")[:40]
+            print(f"  {i:>3d}. [{r['aweme_id']}] {desc_short}")
+            if r.get("error_msg"):
+                print(f"       上次错误: {r['error_msg'][:80]}")
+
+        success = 0
+        still_failed = 0
+        with db as progress_db:
+            for i, r in enumerate(failed_list, 1):
+                aweme_id = r["aweme_id"]
+                save_path = Path(r["file_path"]) if r.get("file_path") else None
+                desc = r.get("desc") or ""
+                mix_name = r.get("mix_name") or ""
+                resource_id = r.get("resource_id") or aweme_id
+                resource_type = r.get("resource_type") or "one"
+
+                print(f"\n  [{i}/{total}] 重试 {aweme_id}")
+
+                # 重新获取视频下载地址（旧地址可能已失效）
+                try:
+                    video = await fetch_one_video(str(aweme_id), cfg)
+                except Exception as e:
+                    print(f"      获取视频信息失败: {e}")
+                    # API 失败也记录到 db，更新 error_msg（meta 无法获取，置 None）
+                    progress_db.record(
+                        aweme_id=str(aweme_id),
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        mix_name=mix_name,
+                        desc=desc[:200],
+                        file_path=str(save_path) if save_path else "",
+                        meta=None,
+                        status="failed",
+                        error_msg=f"获取视频信息失败: {str(e)[:400]}",
+                        retry_count=r.get("retry_count", 0) + cfg.download_max_retries,
+                    )
+                    still_failed += 1
+                    continue
+
+                play_addr = video.get("video_play_addr")
+                if isinstance(play_addr, list):
+                    play_addr = play_addr[0] if play_addr else None
+                if not play_addr:
+                    print(f"      无视频地址，跳过")
+                    progress_db.record(
+                        aweme_id=str(aweme_id),
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        mix_name=mix_name,
+                        desc=desc[:200],
+                        file_path=str(save_path) if save_path else "",
+                        meta=video.get("_meta"),
+                        status="failed",
+                        error_msg="无视频下载地址",
+                        retry_count=r.get("retry_count", 0) + cfg.download_max_retries,
+                    )
+                    still_failed += 1
+                    continue
+
+                # 复用原 file_path，保持目录结构一致
+                if not save_path:
+                    name = _sanitize_filename(desc, cfg.filename_max_len) or aweme_id
+                    date_str = datetime.now().strftime("%Y%m%d")
+                    save_path = self.output_dir / f"{date_str}_{name}.mp4"
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+
+                download_ok, last_error, attempt = await self._download_with_retry(
+                    play_addr, save_path
+                )
+
+                if download_ok:
+                    success += 1
+                    # 下载元数据（封面/文案/原声/JSON）
+                    if cfg.save_metadata:
+                        base_path = save_path.with_suffix("")
+                        await download_metadata(video, base_path, cfg)
+                    # 更新 db 记录为成功
+                    progress_db.record(
+                        aweme_id=str(aweme_id),
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        mix_name=mix_name,
+                        desc=desc[:200],
+                        file_path=str(save_path),
+                        meta=video.get("_meta"),
+                        status="success",
+                        error_msg=None,
+                        retry_count=attempt,
+                    )
+                else:
+                    still_failed += 1
+                    # 更新 db 记录为失败（累加重试次数）
+                    progress_db.record(
+                        aweme_id=str(aweme_id),
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        mix_name=mix_name,
+                        desc=desc[:200],
+                        file_path=str(save_path),
+                        meta=video.get("_meta"),
+                        status="failed",
+                        error_msg=last_error[:500],
+                        retry_count=r.get("retry_count", 0) + attempt + 1,
+                    )
+
+                # 失败记录之间也等待间隔，避免风控（最后一个不等待）
+                if i < total and cfg.mix_download_interval > 0:
+                    print(f"      等待 {cfg.mix_download_interval} 秒后继续...")
+                    await asyncio.sleep(cfg.mix_download_interval)
+
+        print(f"\n[retry-failed] 完成: 成功 {success}/{total}，仍失败 {still_failed}")
+        return {
+            "total": total,
+            "success": success,
+            "still_failed": still_failed,
+        }
 
     async def run(self, share_url: str) -> Dict[str, Any]:
         """主入口：解析链接 → 获取视频列表 → 下载。
@@ -850,26 +1082,31 @@ class DouyinDownloader:
                 else:
                     save_path = target_dir / f"{date_str}_{name}.mp4"
 
-                # 跳过判断：文件已存在 或 进度数据库已记录
+                # 跳过判断：文件已存在 或 进度数据库已记录为成功
                 # force=True 时跳过此检查，强制重新下载
+                # 注意：失败记录（status='failed'）不跳过，会重新下载
                 if not self.force:
                     if save_path.exists():
                         print(f"  [{i}/{len(videos)}] {save_path.name} 文件已存在，跳过")
                         success += 1
                         skipped += 1
                         continue
-                    if progress_db and progress_db.is_downloaded(aweme_id):
+                    if progress_db and progress_db.is_success_downloaded(str(aweme_id)):
                         print(f"  [{i}/{len(videos)}] {save_path.name} 进度记录已存在，跳过")
                         skipped += 1
                         continue
 
                 print(f"  [{i}/{len(videos)}] 下载 {save_path.name}")
-                try:
-                    await download_video(play_addr, save_path, cfg)
-                    success += 1
+                # 下载重试：失败时自动重试 download_max_retries 次（0 表示不重试）
+                download_ok, last_error, attempt = await self._download_with_retry(
+                    play_addr, save_path
+                )
 
+                meta = v.get("_meta") or {}
+
+                if download_ok:
+                    success += 1
                     # 打印视频元数据（从 API 响应提取）
-                    meta = v.get("_meta") or {}
                     if meta:
                         dur = meta.get("duration") or 0
                         w = meta.get("width") or 0
@@ -896,7 +1133,7 @@ class DouyinDownloader:
                         base_path = save_path.with_suffix("")
                         await download_metadata(v, base_path, cfg)
 
-                    # 记录到进度数据库（含视频元数据）
+                    # 记录到进度数据库（成功，含视频元数据与重试次数）
                     if progress_db:
                         progress_db.record(
                             aweme_id=str(aweme_id),
@@ -905,10 +1142,26 @@ class DouyinDownloader:
                             mix_name=mix_name,
                             desc=desc[:200],
                             file_path=str(save_path),
-                            meta=v.get("_meta"),
+                            meta=meta,
+                            status="success",
+                            error_msg=None,
+                            retry_count=attempt,
                         )
-                except Exception as e:
-                    print(f"      下载失败: {e}")
+                else:
+                    # 下载失败也记录到数据库，便于后续 --retry-failed 重试
+                    if progress_db:
+                        progress_db.record(
+                            aweme_id=str(aweme_id),
+                            resource_type=kind,
+                            resource_id=resource_id,
+                            mix_name=mix_name,
+                            desc=desc[:200],
+                            file_path=str(save_path),
+                            meta=meta,
+                            status="failed",
+                            error_msg=last_error[:500],
+                            retry_count=attempt,
+                        )
 
                 # 合集场景：视频间间隔等待（最后一个不需要）
                 if download_interval and i < len(videos):
@@ -989,51 +1242,17 @@ def main():
         help="强制重新下载，忽略进度数据库记录",
     )
     parser.add_argument(
+        "-r", "--retry-failed",
+        action="store_true",
+        help="重试数据库中所有下载失败的记录（status='failed'），无需提供 url/-i",
+    )
+    parser.add_argument(
         "-m", "--metadata",
         nargs="?", const="all", default=None,
         help="保存元数据，可选类型: all/cover/desc/music/json（逗号分隔多个）；"
              "仅 -m 等同于 all；未指定时使用 config.yaml 中的 save_metadata 设置",
     )
     args = parser.parse_args()
-
-    # ── 收集所有 URL 来源（url 参数 + 输入文件） ──
-    raw_texts: List[str] = []
-    if args.url:
-        raw_texts.append(args.url)
-    input_path: Optional[Path] = None
-    if args.input_file:
-        input_path = Path(args.input_file)
-        if not input_path.exists():
-            print(f"错误: 输入文件不存在: {input_path}", file=sys.stderr)
-            sys.exit(1)
-        file_content = input_path.read_text(encoding="utf-8")
-        if not file_content.strip():
-            print(f"错误: 输入文件内容为空: {input_path}", file=sys.stderr)
-            sys.exit(1)
-        raw_texts.append(file_content)
-
-    if not raw_texts:
-        print("错误: 未提供分享链接，请通过 url 参数或 -i/--input-file 指定", file=sys.stderr)
-        sys.exit(1)
-
-    # 从所有文本来源中提取 URL（支持空格/换行分隔多链接）
-    # 用户可能用反引号包裹 URL（如 markdown 示例），strip 掉反引号
-    urls: List[str] = []
-    for text in raw_texts:
-        found = re.findall(r'https?://[^\s，,]+', text)
-        urls.extend(u.strip("`") for u in found if u.strip("`"))
-    # 去重并保序（同一链接在文件和参数中同时出现时只下载一次）
-    seen = set()
-    dedup_urls: List[str] = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            dedup_urls.append(u)
-    urls = dedup_urls
-
-    if not urls:
-        print("错误: 未在输入中找到有效的 URL", file=sys.stderr)
-        sys.exit(1)
 
     # 加载配置
     config_path = Path(args.config) if args.config else None
@@ -1065,6 +1284,51 @@ def main():
         config=config,
         force=args.force,
     )
+
+    # ── --retry-failed 模式：重试 db 中的失败记录，不需要 url/-i ──
+    if args.retry_failed:
+        asyncio.run(dl.retry_failed())
+        return
+
+    # ── 收集所有 URL 来源（url 参数 + 输入文件） ──
+    raw_texts: List[str] = []
+    if args.url:
+        raw_texts.append(args.url)
+    input_path: Optional[Path] = None
+    if args.input_file:
+        input_path = Path(args.input_file)
+        if not input_path.exists():
+            print(f"错误: 输入文件不存在: {input_path}", file=sys.stderr)
+            sys.exit(1)
+        file_content = input_path.read_text(encoding="utf-8")
+        if not file_content.strip():
+            print(f"错误: 输入文件内容为空: {input_path}", file=sys.stderr)
+            sys.exit(1)
+        raw_texts.append(file_content)
+
+    if not raw_texts:
+        print("错误: 未提供分享链接，请通过 url 参数或 -i/--input-file 指定，"
+              "或使用 -r/--retry-failed 重试失败记录", file=sys.stderr)
+        sys.exit(1)
+
+    # 从所有文本来源中提取 URL（支持空格/换行分隔多链接）
+    # 用户可能用反引号包裹 URL（如 markdown 示例），strip 掉反引号
+    urls: List[str] = []
+    for text in raw_texts:
+        found = re.findall(r'https?://[^\s，,]+', text)
+        urls.extend(u.strip("`") for u in found if u.strip("`"))
+    # 去重并保序（同一链接在文件和参数中同时出现时只下载一次）
+    seen = set()
+    dedup_urls: List[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            dedup_urls.append(u)
+    urls = dedup_urls
+
+    if not urls:
+        print("错误: 未在输入中找到有效的 URL", file=sys.stderr)
+        sys.exit(1)
 
     # 多链接串行下载（asyncio.run 只能调用一次，包一层协程循环）
     async def run_all() -> None:

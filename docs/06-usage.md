@@ -26,11 +26,13 @@ uv run python -m douyindl [url] [选项]
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |
 | `-f, --force` | 强制重新下载，忽略进度数据库记录 | 关闭 |
+| `-r, --retry-failed` | 重试数据库中所有下载失败的记录（无需提供 url/-i） | 关闭 |
 | `-m [TYPES]` | 保存元数据，可选 `all`/`cover`/`desc`/`music`/`json`（逗号分隔）；仅 `-m` 等同于 `all` | 关闭 |
 
 > `url` 与 `-i` 至少指定一个，可同时使用（两处链接合并去重后串行下载）。
+> `-r` 单独使用，从数据库查询失败记录并重新下载，无需提供 url/-i。
 > `url` 支持直接粘贴抖音 App 分享的完整文本（含乱码字符），脚本会用正则自动提取其中的 URL。
-> 也支持空格分隔多个链接，串行下载（详见下方场景 7）。
+> 也支持空格分隔多个链接，串行下载（详见下方场景 8）。
 
 ## 使用场景
 
@@ -90,14 +92,32 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/SlGTwuMq498/" -f
 ```
 
-### 6. 自定义配置文件
+### 6. 重试下载失败的记录
+
+下载失败的视频会记录到数据库（status='failed'），不会跳过。网络恢复后可用 `-r/--retry-failed` 一键重试所有失败记录，无需重新提供链接：
+
+```bash
+# 重试数据库中所有失败记录
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl -r
+```
+
+流程：
+- 从数据库查询所有 `status='failed'` 的记录
+- 对每条记录用 aweme_id 重新获取下载地址（旧地址可能已失效）
+- 下载到原路径（带重试，复用 `download_max_retries` 配置）
+- 成功则更新为 `status='success'`，失败则刷新 error_msg 和 retry_count
+- 失败记录之间等待 `mix_download_interval` 秒，避免风控
+
+> 下载失败时会自动重试 `download_max_retries` 次（默认 3 次），重试间隔 `download_retry_interval` 秒（默认 5 秒），均可在 config.yaml 配置。
+
+### 7. 自定义配置文件
 
 ```bash
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/SlGTwuMq498/" -c /path/to/custom-config.yaml
 ```
 
-### 7. 从文件读取链接（推荐用于多链接）
+### 8. 从文件读取链接（推荐用于多链接）
 
 当链接较多时，命令行会变得冗长。可将分享链接粘贴到文件中，通过 `-i/--input-file` 参数读取。
 
@@ -118,7 +138,7 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl -i links.txt -o ./downloads
 - 可与 `url` 参数同时使用，两处链接合并去重后串行下载
 - 文件不存在或内容为空时报错退出，不会静默跳过
 
-### 8. 批量下载多个链接
+### 9. 批量下载多个链接
 
 `url` 参数支持空格分隔多个链接，脚本自动提取所有 URL 并串行下载。
 

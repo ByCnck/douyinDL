@@ -44,8 +44,11 @@ uv run python -m douyindl "<链接>" -c /path/to/custom-config.yaml
 | `mix_download_interval` | int | 60 | 合集内视频下载间隔（秒），防封 IP；单视频无需等待 |
 | `chunk_size` | int | 65536 | 流式下载 chunk 大小（字节），默认 64KB |
 | `filename_max_len` | int | 60 | 下载文件名最大长度（字符），超长截断 |
+| `download_max_retries` | int | 3 | 下载失败时的最大重试次数（不含首次下载），0 表示不重试 |
+| `download_retry_interval` | float | 5.0 | 下载重试间隔（秒），失败后等待多久再重试 |
 
 > `mix_download_interval` 是用户明确要求的 60 秒间隔，避免频繁下载合集导致 IP 封禁。
+> `download_max_retries` 控制单个视频下载失败后的自动重试次数，重试间隔由 `download_retry_interval` 控制。无论成功失败都会记录到数据库，失败记录可通过 `-r/--retry-failed` 重新下载。
 
 ### 元数据保存
 
@@ -78,7 +81,7 @@ uv run python -m douyindl "<链接>" -c /path/to/custom-config.yaml
 
 从高到低：
 
-1. **CLI 参数**（`-o` / `-n` / `-m` / `-f` 等）
+1. **CLI 参数**（`-o` / `-n` / `-m` / `-f` / `-r` 等）
 2. **`-c` 指定的配置文件**（若未指定则用默认 `config/config.yaml`）
 3. **代码内默认值**（`Config.__init__` 中的 `data.get(key, default)`）
 
@@ -102,6 +105,8 @@ api_request_interval: 2.0
 mix_download_interval: 60
 chunk_size: 65536
 filename_max_len: 60
+download_max_retries: 3
+download_retry_interval: 5.0
 
 # 元数据保存
 save_metadata: false
@@ -114,7 +119,7 @@ save_json: true
 enable_progress: true
 progress_db_path: ".douyindl/progress.db"
 
-# 输出目录相关
+# 输出相关
 output_dir: "./downloads"
 ```
 

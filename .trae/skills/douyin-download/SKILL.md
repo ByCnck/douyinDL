@@ -44,9 +44,11 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl "<分享链接或文本>" -o
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |
 | `-f, --force` | 强制重新下载，忽略进度数据库记录 | 关闭 |
+| `-r, --retry-failed` | 重试数据库中所有下载失败的记录（无需提供 url/-i） | 关闭 |
 | `-m [TYPES]`, `--metadata [TYPES]` | 保存元数据，可选 `all`/`cover`/`desc`/`music`/`json`（逗号分隔多个）；仅 `-m` 等同于 `all` | 关闭 |
 
 > `url` 与 `-i` 至少指定一个，可同时使用（两处链接合并去重后串行下载）。
+> `-r` 单独使用，从数据库查询失败记录并重新下载。
 
 ### 示例
 
@@ -93,6 +95,10 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
 # 10. 从文件读取链接（多个链接粘贴到文件，下载后自动清空）
 #     文件支持多行/空格分隔，适合链接较多的场景
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl -i links.txt -o ./downloads
+
+# 11. 重试数据库中所有下载失败的记录（无需提供链接）
+#     下载失败会自动重试 download_max_retries 次，失败记录入库，可用 -r 一键重试
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl -r
 ```
 
 ## 输出结构
@@ -126,6 +132,8 @@ downloads/
 | `mix_download_interval` | 合集视频下载间隔（秒，防封 IP） | 60 |
 | `chunk_size` | 流式下载 chunk 大小（字节） | 65536 |
 | `filename_max_len` | 文件名最大长度 | 60 |
+| `download_max_retries` | 下载失败重试次数（不含首次，0 不重试） | 3 |
+| `download_retry_interval` | 下载重试间隔（秒） | 5.0 |
 | `save_metadata` | 是否保存元数据（封面/文案/原声/JSON） | false |
 | `save_cover` / `save_desc` / `save_music` / `save_json` | 元数据子开关 | true |
 | `enable_progress` | 是否启用进度数据库 | true |
