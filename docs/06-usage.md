@@ -15,18 +15,20 @@ cd /Users/zhenxi/codes/python/douyinDL
 ## CLI 参数
 
 ```bash
-uv run python -m douyindl <url> [选项]
+uv run python -m douyindl [url] [选项]
 ```
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `url` | 抖音分享链接或包含链接的分享文本（必填）；支持空格分隔多个链接 | - |
+| `url` | 抖音分享链接或包含链接的分享文本（可选）；支持空格分隔多个链接。未指定时需用 `-i` | - |
+| `-i, --input-file` | 从文件读取分享链接（多行/空格分隔），下载完成后清空文件，便于反复复用 | - |
 | `-o, --output` | 视频保存根目录 | `./downloads`（config.yaml 可改） |
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |
 | `-f, --force` | 强制重新下载，忽略进度数据库记录 | 关闭 |
 | `-m [TYPES]` | 保存元数据，可选 `all`/`cover`/`desc`/`music`/`json`（逗号分隔）；仅 `-m` 等同于 `all` | 关闭 |
 
+> `url` 与 `-i` 至少指定一个，可同时使用（两处链接合并去重后串行下载）。
 > `url` 支持直接粘贴抖音 App 分享的完整文本（含乱码字符），脚本会用正则自动提取其中的 URL。
 > 也支持空格分隔多个链接，串行下载（详见下方场景 7）。
 
@@ -95,7 +97,28 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/SlGTwuMq498/" -c /path/to/custom-config.yaml
 ```
 
-### 7. 批量下载多个链接
+### 7. 从文件读取链接（推荐用于多链接）
+
+当链接较多时，命令行会变得冗长。可将分享链接粘贴到文件中，通过 `-i/--input-file` 参数读取。
+
+```bash
+# 1. 把分享链接粘贴到文件（每行一个，或同一行空格分隔多个）
+#    文件内容示例 links.txt：
+#    https://v.douyin.com/SlGTwuMq498/
+#    https://v.douyin.com/LQVBJcukSyA/ https://v.douyin.com/LusIAXyGX-I/
+
+# 2. 执行下载
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl -i links.txt -o ./downloads
+```
+
+特点：
+- 文件支持多行，每行也可包含多个空格分隔的链接，脚本自动提取所有 URL
+- **下载完成后自动清空文件内容**（保留文件本身），便于反复粘贴新链接复用
+- 即使某些链接已下载过被跳过，文件仍会被清空（视为已处理）
+- 可与 `url` 参数同时使用，两处链接合并去重后串行下载
+- 文件不存在或内容为空时报错退出，不会静默跳过
+
+### 8. 批量下载多个链接
 
 `url` 参数支持空格分隔多个链接，脚本自动提取所有 URL 并串行下载。
 

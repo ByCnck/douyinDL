@@ -38,12 +38,15 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl "<分享链接或文本>" -o
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `url` | 抖音分享链接或包含链接的分享文本（必填）；支持空格分隔多个链接 | - |
+| `url` | 抖音分享链接或包含链接的分享文本（可选）；支持空格分隔多个链接。未指定时需用 `-i` | - |
+| `-i, --input-file` | 从文件读取分享链接（多行/空格分隔），下载完成后清空文件，便于反复复用 | - |
 | `-o, --output` | 视频保存根目录 | `./downloads`（config.yaml 可改） |
 | `-n, --max-counts` | 最大下载视频数，0 表示不限 | `0` |
 | `-c, --config` | 配置文件路径 | `config/config.yaml` |
 | `-f, --force` | 强制重新下载，忽略进度数据库记录 | 关闭 |
 | `-m [TYPES]`, `--metadata [TYPES]` | 保存元数据，可选 `all`/`cover`/`desc`/`music`/`json`（逗号分隔多个）；仅 `-m` 等同于 `all` | 关闭 |
+
+> `url` 与 `-i` 至少指定一个，可同时使用（两处链接合并去重后串行下载）。
 
 ### 示例
 
@@ -86,6 +89,10 @@ NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
 NO_PROXY='*' no_proxy='*' uv run python -m douyindl \
   "https://v.douyin.com/LusIAXyGX-I/ https://v.douyin.com/w531WJ7dzEw/" \
   -o ./downloads
+
+# 10. 从文件读取链接（多个链接粘贴到文件，下载后自动清空）
+#     文件支持多行/空格分隔，适合链接较多的场景
+NO_PROXY='*' no_proxy='*' uv run python -m douyindl -i links.txt -o ./downloads
 ```
 
 ## 输出结构

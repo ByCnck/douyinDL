@@ -944,7 +944,12 @@ class _NullContext:
 
 
 def main():
-    """CLI 入口：python -m douyindl <分享链接> [输出目录]"""
+    """CLI 入口：python -m douyindl <分享链接> [输出目录]
+
+    链接来源（二选一或组合）：
+    - url 位置参数：直接传入分享文本（支持空格分隔多个链接）
+    - -i/--input-file：从文件读取分享文本（支持多行/空格分隔），下载完成后清空文件
+    """
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -952,7 +957,16 @@ def main():
     )
     parser.add_argument(
         "url",
-        help="抖音分享链接（短链或完整URL，可包含分享文本）；支持空格分隔多个链接",
+        nargs="?",
+        default=None,
+        help="抖音分享链接（短链或完整URL，可包含分享文本）；支持空格分隔多个链接。"
+             "若未指定，需通过 -i/--input-file 提供链接文件",
+    )
+    parser.add_argument(
+        "-i", "--input-file",
+        default=None,
+        help="从文件读取分享链接（每行一个或空格分隔多个），下载完成后清空文件内容，"
+             "便于反复粘贴新链接复用该文件",
     )
     parser.add_argument(
         "-o", "--output",
@@ -982,10 +996,41 @@ def main():
     )
     args = parser.parse_args()
 
-    # 从分享文本中提取所有 URL（支持空格/换行分隔多链接）
+    # ── 收集所有 URL 来源（url 参数 + 输入文件） ──
+    raw_texts: List[str] = []
+    if args.url:
+        raw_texts.append(args.url)
+    input_path: Optional[Path] = None
+    if args.input_file:
+        input_path = Path(args.input_file)
+        if not input_path.exists():
+            print(f"错误: 输入文件不存在: {input_path}", file=sys.stderr)
+            sys.exit(1)
+        file_content = input_path.read_text(encoding="utf-8")
+        if not file_content.strip():
+            print(f"错误: 输入文件内容为空: {input_path}", file=sys.stderr)
+            sys.exit(1)
+        raw_texts.append(file_content)
+
+    if not raw_texts:
+        print("错误: 未提供分享链接，请通过 url 参数或 -i/--input-file 指定", file=sys.stderr)
+        sys.exit(1)
+
+    # 从所有文本来源中提取 URL（支持空格/换行分隔多链接）
     # 用户可能用反引号包裹 URL（如 markdown 示例），strip 掉反引号
-    urls = re.findall(r'https?://[^\s，,]+', args.url)
-    urls = [u.strip("`") for u in urls if u.strip("`")]
+    urls: List[str] = []
+    for text in raw_texts:
+        found = re.findall(r'https?://[^\s，,]+', text)
+        urls.extend(u.strip("`") for u in found if u.strip("`"))
+    # 去重并保序（同一链接在文件和参数中同时出现时只下载一次）
+    seen = set()
+    dedup_urls: List[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            dedup_urls.append(u)
+    urls = dedup_urls
+
     if not urls:
         print("错误: 未在输入中找到有效的 URL", file=sys.stderr)
         sys.exit(1)
@@ -1067,6 +1112,11 @@ def main():
                 print()
 
     asyncio.run(run_all())
+
+    # 下载完成后清空输入文件内容（保留文件本身），便于反复粘贴新链接复用
+    if input_path and input_path.exists():
+        input_path.write_text("", encoding="utf-8")
+        print(f"\n已清空输入文件: {input_path}")
 
 
 if __name__ == "__main__":
