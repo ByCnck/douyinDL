@@ -19,6 +19,7 @@ import random
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -61,6 +62,7 @@ class Config:
     filename_max_len: int
     download_max_retries: int
     download_retry_interval: float
+    max_download_speed: int
 
     # 元数据保存
     save_metadata: bool
@@ -105,6 +107,8 @@ class Config:
         self.download_max_retries = int(data.get("download_max_retries", 3))
         # 下载重试间隔（秒），失败后等待多久再重试
         self.download_retry_interval = float(data.get("download_retry_interval", 5.0))
+        # 最大下载速度（字节/秒），0 表示不限速；如 10MB/s = 10485760
+        self.max_download_speed = int(data.get("max_download_speed", 0))
 
         # 元数据保存：总开关默认关闭，子开关默认开启
         self.save_metadata = bool(data.get("save_metadata", False))
@@ -417,7 +421,7 @@ async def download_video(
     Args:
         video_url: 无水印视频下载地址
         save_path: 保存路径（含文件名）
-        config: 配置对象（使用 chunk_size / timeout / user_agent）
+        config: 配置对象（使用 chunk_size / timeout / user_agent / max_download_speed）
         headers: 额外请求头
 
     Returns:
@@ -432,6 +436,12 @@ async def download_video(
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
     req_headers = config.default_headers | (headers or {})
+
+    # 限速配置：max_download_speed 字节/秒，0 表示不限速
+    # 限速原理：每下载一个 chunk 后，按累计字节数计算"期望用时"，
+    # 若实际用时小于期望用时（下载太快），sleep 差值以降低速度
+    max_speed = config.max_download_speed
+    speed_limit_start = time.monotonic() if max_speed > 0 else 0
 
     downloaded = 0
     total = 0
@@ -449,6 +459,13 @@ async def download_video(
                     f.write(chunk)
                     downloaded += len(chunk)
                     _print_progress(downloaded, total)
+
+                    # 限速：实际用时小于期望用时则 sleep 差值
+                    if max_speed > 0:
+                        expected_time = downloaded / max_speed
+                        actual_time = time.monotonic() - speed_limit_start
+                        if actual_time < expected_time:
+                            await asyncio.sleep(expected_time - actual_time)
 
     # 进度条换行
     if total:

@@ -46,9 +46,11 @@ uv run python -m douyindl "<链接>" -c /path/to/custom-config.yaml
 | `filename_max_len` | int | 60 | 下载文件名最大长度（字符），超长截断 |
 | `download_max_retries` | int | 3 | 下载失败时的最大重试次数（不含首次下载），0 表示不重试 |
 | `download_retry_interval` | float | 5.0 | 下载重试间隔（秒），失败后等待多久再重试 |
+| `max_download_speed` | int | 0 | 最大下载速度（字节/秒），0 表示不限速；如 10MB/s = 10485760 |
 
 > `mix_download_interval` 是间隔基准值，实际等待时间在 `base*0.9` 到 `base` 之间随机取数（如 60 秒基准值实际等待 54-60 秒），避免固定间隔被风控识别。该间隔用于合集内视频之间、多链接之间、失败重试记录之间。
 > `download_max_retries` 控制单个视频下载失败后的自动重试次数，重试间隔由 `download_retry_interval` 控制。无论成功失败都会记录到数据库，失败记录可通过 `-r/--retry-failed` 重新下载。
+> `max_download_speed` 控制下载速度上限，0 表示不限速。限速原理：每下载一个 chunk 后按累计字节数计算期望用时，实际用时不足则 sleep 差值。常用值：10MB/s=10485760，5MB/s=5242880，1MB/s=1048576。
 
 ### 元数据保存
 
@@ -107,6 +109,7 @@ chunk_size: 65536
 filename_max_len: 60
 download_max_retries: 3
 download_retry_interval: 5.0
+max_download_speed: 0
 
 # 元数据保存
 save_metadata: false

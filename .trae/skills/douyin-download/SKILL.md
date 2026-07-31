@@ -134,6 +134,7 @@ downloads/
 | `filename_max_len` | 文件名最大长度 | 60 |
 | `download_max_retries` | 下载失败重试次数（不含首次，0 不重试） | 3 |
 | `download_retry_interval` | 下载重试间隔（秒） | 5.0 |
+| `max_download_speed` | 最大下载速度（字节/秒，0 不限速，10MB/s=10485760） | 0 |
 | `save_metadata` | 是否保存元数据（封面/文案/原声/JSON） | false |
 | `save_cover` / `save_desc` / `save_music` / `save_json` | 元数据子开关 | true |
 | `enable_progress` | 是否启用进度数据库 | true |
