@@ -1278,7 +1278,7 @@ def main():
 
     链接来源（二选一或组合）：
     - url 位置参数：直接传入分享文本（支持空格分隔多个链接）
-    - -i/--input-file：从文件读取分享文本（支持多行/空格分隔），下载完成后清空文件
+    - -i/--input-file：从文件读取分享文本（支持多行/空格分隔），下载后保留文件内容不清空
     """
     import argparse
 
@@ -1295,8 +1295,8 @@ def main():
     parser.add_argument(
         "-i", "--input-file",
         default=None,
-        help="从文件读取分享链接（每行一个或空格分隔多个），下载完成后清空文件内容，"
-             "便于反复粘贴新链接复用该文件",
+        help="从文件读取分享链接（每行一个或空格分隔多个），下载完成后保留文件内容，"
+             "不清空；已下载视频会被进度库/文件存在检查自动跳过，可反复复用该文件",
     )
     parser.add_argument(
         "-o", "--output",
@@ -1457,10 +1457,9 @@ def main():
     asyncio.run(run_all())
 
     # 下载完成后清空输入文件内容（保留文件本身），便于反复粘贴新链接复用
-    if input_path and input_path.exists():
-        input_path.write_text("", encoding="utf-8")
-        print(f"\n已清空输入文件: {input_path}")
-
+    # if input_path and input_path.exists():
+        # input_path.write_text("", encoding="utf-8")
+        # print(f"\n已清空输入文件: {input_path}")
 
 if __name__ == "__main__":
     main()
