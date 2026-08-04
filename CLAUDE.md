@@ -94,6 +94,7 @@ douyinDL/
 - **进度库相对路径**：`ProgressDB` 路径相对当前工作目录解析（CLI 运行时 cwd=项目根）。非 CLI 调用时注意 cwd。
 - **`downloads/` 与 `.douyindl/`** 是运行产物，已下载视频/进度库不要误删；`downloads/` 下 72 个 mp4 为既有成果。
 - **不要引入系统级依赖**：新增第三方包必须加进 `pyproject.toml` 并 `uv lock` / `uv sync`，保持隔离。
+- **文件命名规则（含 aweme_id，防碰撞）**：文件名由 `_build_video_name(desc, aweme_id)` 生成，格式 `<base>_<aweme_id>.mp4`。`base` 优先级：真实文案（去除 #话题 后的文本）> 话题文字拼接（如 `比亚迪_原创作品`）> `untitled`。合集内为 `001_<base>_<aweme_id>.mp4`，单视频为 `YYYYMMDD_<base>_<aweme_id>.mp4`。**末尾强制带 aweme_id**，确保多个无标题/同名视频不会因文件存在被误跳过。改动命名逻辑只看这个函数，别再用旧的 `_sanitize_filename` 生成视频文件名（它仍用于合集目录名）。
 
 ## AI 技能（Skill）
 

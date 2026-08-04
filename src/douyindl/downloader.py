@@ -410,6 +410,44 @@ def _sanitize_filename(name: str, max_len: int = 60) -> str:
     return name or "untitled"
 
 
+def _extract_topics(desc: str) -> List[str]:
+    """从文案中提取 #话题 标签文字（不含分隔符 _/#/空白）。
+
+    例: '#比亚迪_#原创作品' -> ['比亚迪', '原创作品']
+    """
+    return re.findall(r"#([^\s#_]+)", desc or "")
+
+
+def _build_video_name(desc: str, aweme_id: str, max_len: int = 60) -> str:
+    """生成视频文件名（不含日期前缀与扩展名）。
+
+    规则：
+    1. 优先使用去除 #话题 后的真实文案；
+    2. 若真实文案为空（整条文案都是话题标签），则拼接话题文字作为名称；
+    3. 仍为空则回退 'untitled'；
+    4. 末尾追加 _<aweme_id> 保证每个视频文件名唯一，
+       避免多个无标题/同名视频被「文件已存在」误判跳过。
+
+    例: '20260804_<base>_<aweme_id>.mp4'
+    """
+    # 1) 去除 #话题 标签，得到真实文案
+    text = re.sub(r"#[^\s#]+", "", desc or "")
+    text = re.sub(r'[\\/:*?"<>|\n\r\t]', "", text).strip()
+    text = re.sub(r"[_\s]+", "_", text).strip("_")
+    # 2) 无真实文案时，用话题文字拼接（如 '比亚迪_原创作品'）
+    if not text:
+        text = "_".join(_extract_topics(desc)).strip("_")
+    # 3) 兜底
+    if not text:
+        text = "untitled"
+    # 4) 拼接 aweme_id（为后缀预留长度预算）
+    suffix = f"_{aweme_id}"
+    budget = max_len - len(suffix)
+    if budget > 0 and len(text) > budget:
+        text = text[:budget].strip("_")
+    return f"{text}{suffix}"
+
+
 async def download_video(
     video_url: str,
     save_path: Path,
@@ -979,7 +1017,7 @@ class DouyinDownloader:
 
                 # 复用原 file_path，保持目录结构一致
                 if not save_path:
-                    name = _sanitize_filename(desc, cfg.filename_max_len) or aweme_id
+                    name = _build_video_name(desc, str(aweme_id), cfg.filename_max_len)
                     date_str = datetime.now().strftime("%Y%m%d")
                     save_path = self.output_dir / f"{date_str}_{name}.mp4"
                 save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1111,9 +1149,9 @@ class DouyinDownloader:
                     print(f"  [{i}/{len(videos)}] {aweme_id} 无视频地址，跳过")
                     continue
 
-                name = _sanitize_filename(desc, cfg.filename_max_len) or aweme_id
-                # 合集内文件：001_文案.mp4（目录已含日期，无需重复）
-                # 单视频文件：YYYYMMDD_文案.mp4
+                name = _build_video_name(desc, str(aweme_id), cfg.filename_max_len)
+                # 合集内文件：001_文案_awemeid.mp4（目录已含日期，无需重复）
+                # 单视频文件：YYYYMMDD_文案_awemeid.mp4
                 if kind == "mix":
                     save_path = target_dir / f"{i:03d}_{name}.mp4"
                 else:
