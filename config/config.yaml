@@ -33,7 +33,7 @@ api_request_interval: 2.0
 
 # 合集内视频下载间隔（秒），合集场景使用，单视频无需等待
 # 用户要求合集间隔 60 秒
-mix_download_interval: 60
+mix_download_interval: 10
 
 # 流式下载 chunk 大小（字节），默认 64KB
 chunk_size: 65536

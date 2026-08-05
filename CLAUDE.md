@@ -95,6 +95,7 @@ douyinDL/
 - **`downloads/` 与 `.douyindl/`** 是运行产物，已下载视频/进度库不要误删；`downloads/` 下 72 个 mp4 为既有成果。
 - **不要引入系统级依赖**：新增第三方包必须加进 `pyproject.toml` 并 `uv lock` / `uv sync`，保持隔离。
 - **文件命名规则（含 aweme_id，防碰撞）**：文件名由 `_build_video_name(desc, aweme_id)` 生成，格式 `<base>_<aweme_id>.mp4`。`base` 优先级：真实文案（去除 #话题 后的文本）> 话题文字拼接（如 `比亚迪_原创作品`）> `untitled`。合集内为 `001_<base>_<aweme_id>.mp4`，单视频为 `YYYYMMDD_<base>_<aweme_id>.mp4`。**末尾强制带 aweme_id**，确保多个无标题/同名视频不会因文件存在被误跳过。改动命名逻辑只看这个函数，别再用旧的 `_sanitize_filename` 生成视频文件名（它仍用于合集目录名）。
+- **f2 `gen_real_msToken` 端点偶发 503 → 已在导入期打兜底补丁**：f2 在 `model.py` 的 `BaseRequestModel.msToken` 类属性里于「导入期」直接调用 `TokenManager.gen_real_msToken()`，该函数请求外部端点 `mssdk.bytedance.com/web/report`，该端点偶发 503/超时。f2 自带的 `try/except` 在 `except` 里又会二次调用同一个会失败的函数，导致**整个模块导入失败、程序起不来**。修复方式：在 `downloader.py` 顶部导入 `crawler/model` **之前**，monkeypatch `TokenManager.gen_real_msToken` 为 `_safe_gen_real_msToken`——真实生成失败时回退 `gen_false_msToken()`（随机虚假 token），契合 f2「出错返回虚假值」意图，**不改动 site-packages**。`uv sync` 后仍生效。若以后升级 f2 大版本，需确认该类名/方法未变。
 
 ## AI 技能（Skill）
 
@@ -116,3 +117,4 @@ douyinDL/
 - `docs/05-progress.md` 进度持久化与数据库结构
 - `docs/06-usage.md` 使用指南与 Skill 集成
 - `docs/07-faq.md` 排查/扩展方向/代码索引/依赖清单/变更记录
+- `docs/08-share-link-mechanism.md` 分享链接机制：为何同视频多次分享得到不同短链、aweme_id 去重原理

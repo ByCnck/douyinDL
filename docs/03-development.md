@@ -172,3 +172,4 @@ def build_cookie() -> str:
 
 - 元数据保存详解：[04-metadata.md](04-metadata.md)
 - 进度持久化数据库结构：[05-progress.md](05-progress.md)
+- 分享链接机制（不同短链为何指向同一视频、aweme_id 去重）：[08-share-link-mechanism.md](08-share-link-mechanism.md)

@@ -87,6 +87,7 @@ downloads/
 | [05-progress.md](docs/05-progress.md) | 进度持久化（SQLite 数据库结构、断点续传、增量下载、视频元数据入库） |
 | [06-usage.md](docs/06-usage.md) | 使用指南（CLI 参数、示例、输出结构）与 Skill 集成 |
 | [07-faq.md](docs/07-faq.md) | 常见问题排查、后续扩展方向、附录（代码索引/依赖清单/变更记录） |
+| [08-share-link-mechanism.md](docs/08-share-link-mechanism.md) | 分享链接机制：为何同视频多次分享得到不同短链、aweme_id 去重原理 |
 
 ## 技术栈
 
