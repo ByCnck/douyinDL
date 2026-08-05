@@ -27,7 +27,30 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 import yaml
 
-# f2 底层组件：crawler / model / filter / token
+# ── f2 msToken 兜底补丁（必须在导入 crawler/model 之前打，否则 f2 导入期即崩溃） ──
+# f2 的 TokenManager.gen_real_msToken 依赖外部端点 mssdk.bytedance.com，该端点
+# 偶发 503/超时。f2 在 model.py 的 BaseRequestModel.msToken 类属性中于「导入期」
+# 直接调用它，而 f2 自带的 try/except 在 except 里又会二次调用同一个会失败的函数，
+# 导致整个模块导入失败、程序无法启动。
+# 这里提前打补丁：真实生成失败时回退到 f2 自带的 gen_false_msToken()（随机虚假
+# token），契合 f2 文档「出错时返回虚假值」的意图，且不改动 site-packages，
+# uv sync / uv lock 后仍生效。
+from f2.apps.douyin.utils import TokenManager as _F2TokenManager
+
+_original_gen_real_msToken = _F2TokenManager.gen_real_msToken.__func__
+
+
+def _safe_gen_real_msToken(cls):
+    try:
+        return _original_gen_real_msToken(cls)
+    except Exception:
+        # 端点故障（503/超时/网络错误等）时回退虚假 token，避免崩溃
+        return _F2TokenManager.gen_false_msToken()
+
+
+_F2TokenManager.gen_real_msToken = classmethod(_safe_gen_real_msToken)
+
+# f2 底层组件：crawler / model / filter / token（此时已使用打过补丁的 TokenManager）
 from f2.apps.douyin.crawler import DouyinCrawler
 from f2.apps.douyin.model import UserMix, PostDetail
 from f2.apps.douyin.filter import UserMixFilter, PostDetailFilter
@@ -136,6 +159,32 @@ class Config:
 
 _MIX_PATH_PATTERN = re.compile(r"/(?:share/mix/detail|collection)/(\d+)")
 _AWEME_ID_PATTERN = re.compile(r"/video/(\d+)")
+# PC Web 端详情页：https://www.douyin.com/jingxuan?modal_id=<aweme_id>
+_AWEME_ID_QS_PATTERN = re.compile(r"[?&]modal_id=(\d+)")
+# PC Web 端合集页：/collection?collection_id=<id> 或 ?mix_id=<id>
+_MIX_ID_QS_PATTERN = re.compile(r"[?&](?:collection_id|mix_id)=(\d+)")
+
+
+def _try_resolve(url: str) -> Optional[Tuple[str, str]]:
+    """从 URL 文本中解析 (资源类型, 资源ID)，未命中返回 None。
+
+    覆盖两类形态：
+      - 路径形态：/video/<id>、/collection/<id>、/share/mix/detail/<id>
+      - PC Web 端查询参数形态：?modal_id=<aweme_id>、?collection_id=<id>、?mix_id=<id>
+    """
+    m = _MIX_PATH_PATTERN.search(url)
+    if m:
+        return "mix", m.group(1)
+    m = _AWEME_ID_PATTERN.search(url)
+    if m:
+        return "one", m.group(1)
+    m = _MIX_ID_QS_PATTERN.search(url)
+    if m:
+        return "mix", m.group(1)
+    m = _AWEME_ID_QS_PATTERN.search(url)
+    if m:
+        return "one", m.group(1)
+    return None
 
 
 # ── 链接解析 ────────────────────────────────────────────────────
@@ -150,16 +199,15 @@ async def resolve_share_url(share_url: str, config: Config) -> Tuple[str, str]:
       - 合集页 https://www.iesdouyin.com/share/mix/detail/{id}/
       - 合集页 https://www.douyin.com/collection/{id}
       - 单视频 https://www.douyin.com/video/{id}
+      - PC Web 端详情页 https://www.douyin.com/jingxuan?modal_id={aweme_id}
+      - PC Web 端合集页 https://www.douyin.com/collection?collection_id={id}
     """
     url = share_url.strip()
 
-    # 先尝试从 URL 本身直接匹配（已是长链接的情况）
-    m = _MIX_PATH_PATTERN.search(url)
-    if m:
-        return "mix", m.group(1)
-    m = _AWEME_ID_PATTERN.search(url)
-    if m:
-        return "one", m.group(1)
+    # 先尝试从 URL 本身直接匹配（已是长链接 / PC Web 端 / 含查询参数的情况）
+    res = _try_resolve(url)
+    if res:
+        return res
 
     # 短链需要跟随重定向
     async with httpx.AsyncClient(
@@ -171,22 +219,10 @@ async def resolve_share_url(share_url: str, config: Config) -> Tuple[str, str]:
         resp = await client.get(url)
         final_url = str(resp.url)
 
-    # iesdouyin 合集页重定向到 douyin.com/collection/{id}
-    m = _MIX_PATH_PATTERN.search(final_url)
-    if m:
-        return "mix", m.group(1)
-    m = _AWEME_ID_PATTERN.search(final_url)
-    if m:
-        return "one", m.group(1)
-
-    # iesdouyin 合集页路径格式 /share/mix/detail/{id}/
-    m = re.search(r"/share/mix/detail/(\d+)", final_url)
-    if m:
-        return "mix", m.group(1)
-    # iesdouyin 单视频 /share/video/{id}/
-    m = re.search(r"/share/video/(\d+)", final_url)
-    if m:
-        return "one", m.group(1)
+    # 重定向后的最终地址再尝试一次（短链可能跳转到 PC Web 端带 modal_id 的页面）
+    res = _try_resolve(final_url)
+    if res:
+        return res
 
     raise ValueError(f"无法从链接解析资源类型: {share_url} → {final_url}")
 
@@ -622,6 +658,7 @@ class ProgressDB:
             resource_id     TEXT NOT NULL,     -- mix_id 或 aweme_id
             mix_name        TEXT,              -- 合集名（单视频为 NULL）
             desc            TEXT,              -- 视频文案
+            url             TEXT,              -- 视频原始分享 URL（用户输入的链接；单视频为其本身，合集为合集链接）
             file_path       TEXT,              -- 保存路径
             -- 视频元数据（从 API 原始响应提取，v0.4.0 新增）
             duration        INTEGER,           -- 视频时长（毫秒）
@@ -694,6 +731,7 @@ class ProgressDB:
             for row in self._conn.execute("PRAGMA table_info(downloaded_videos)")
         }
         new_cols = {
+            "url": "TEXT",
             "duration": "INTEGER",
             "width": "INTEGER",
             "height": "INTEGER",
@@ -755,6 +793,7 @@ class ProgressDB:
         mix_name: str,
         desc: str,
         file_path: str,
+        url: Optional[str] = None,
         meta: Optional[Dict[str, Any]] = None,
         status: str = "success",
         error_msg: Optional[str] = None,
@@ -763,6 +802,8 @@ class ProgressDB:
         """记录一条下载记录（已存在则更新），无论成功失败都记录。
 
         Args:
+            url: 视频原始分享 URL（用户输入的链接）；单视频为其本身，合集为合集链接。
+                  重试场景下传 None，通过 COALESCE 保留已有值，不覆盖。
             meta: 视频元数据字典，可包含 duration/width/height/file_size/
                   bit_rate/fps/ratio/video_format/is_h265/nickname/
                   digg_count/comment_count/share_count/collect_count/create_time
@@ -776,18 +817,19 @@ class ProgressDB:
         meta = meta or {}
         self._conn.execute(
             """INSERT INTO downloaded_videos
-               (aweme_id, resource_type, resource_id, mix_name, desc, file_path,
+               (aweme_id, resource_type, resource_id, mix_name, desc, file_path, url,
                 duration, width, height, file_size, bit_rate, fps, ratio,
                 video_format, is_h265, nickname, digg_count, comment_count,
                 share_count, collect_count, create_time,
                 status, error_msg, retry_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(aweme_id) DO UPDATE SET
                    resource_type=excluded.resource_type,
                    resource_id=excluded.resource_id,
                    mix_name=excluded.mix_name,
                    desc=excluded.desc,
                    file_path=excluded.file_path,
+                   url=COALESCE(excluded.url, url),
                    duration=excluded.duration,
                    width=excluded.width,
                    height=excluded.height,
@@ -809,7 +851,7 @@ class ProgressDB:
                    downloaded_at=CURRENT_TIMESTAMP
             """,
             (
-                aweme_id, resource_type, resource_id, mix_name, desc, file_path,
+                aweme_id, resource_type, resource_id, mix_name, desc, file_path, url,
                 meta.get("duration"),
                 meta.get("width"),
                 meta.get("height"),
@@ -1217,6 +1259,7 @@ class DouyinDownloader:
                             mix_name=mix_name,
                             desc=desc[:200],
                             file_path=str(save_path),
+                            url=share_url,
                             meta=meta,
                             status="success",
                             error_msg=None,
@@ -1232,6 +1275,7 @@ class DouyinDownloader:
                             mix_name=mix_name,
                             desc=desc[:200],
                             file_path=str(save_path),
+                            url=share_url,
                             meta=meta,
                             status="failed",
                             error_msg=last_error[:500],
@@ -1394,14 +1438,9 @@ def main():
     for text in raw_texts:
         found = re.findall(r'https?://[^\s，,]+', text)
         urls.extend(u.strip("`") for u in found if u.strip("`"))
-    # 去重并保序（同一链接在文件和参数中同时出现时只下载一次）
-    seen = set()
-    dedup_urls: List[str] = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            dedup_urls.append(u)
-    urls = dedup_urls
+    # 去重并保持源文件 URL 顺序（严禁排序）：同一链接只下载一次，
+    # dict.fromkeys 利用字典保序特性实现有序去重，等价于按文件出现顺序去重
+    urls = list(dict.fromkeys(urls))
 
     if not urls:
         print("错误: 未在输入中找到有效的 URL", file=sys.stderr)
