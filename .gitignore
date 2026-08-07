@@ -15,6 +15,7 @@ downloads/
 logs/
 *.db
 .douyindl/
+app.log
 
 # ── 编辑器 / IDE ────────────────────────────────
 .vscode/

@@ -83,6 +83,7 @@ douyinDL/
 - **`ProgressDB`**：SQLite 表 `downloaded_videos`，主键 `aweme_id`；`_migrate_schema` 用 `PRAGMA table_info` 检测缺失列并 `ALTER TABLE ADD COLUMN` 做版本迁移（兼容 v0.3→v0.5 旧库）。`status` 字段记录 `success`/`failed`，失败不跳过、可重跑。
 - **`DouyinDownloader`**：主流程 `run()`（解析→拉列表→下载→入库），`_download_with_retry`（受 `download_max_retries`）、`retry_failed()`（查失败记录→重新取地址→下载→更新库）。`main()` 为 CLI 入口，多链接串行、去重、下载后清空 `-i` 文件。
 - **风控**：合集视频间隔、多链接间隔、失败重试间隔均通过 `_random_interval(base)` 在 `[base*0.9, base]` 随机取值，避免固定间隔被识别。
+- **日志（loguru，双写）**：`src/douyindl/logger.py` 的 `setup_logger()` 配置两个 sink——**控制台（stderr）级别由 `config.log_level` 控制（默认 INFO）** + **文件 `app.log` 固定 DEBUG**。代码内已按级别区分：`DEBUG`=`[1/4]~[4/4]` 步骤脚手架/列表枚举/等待间隔；`INFO`=单条结果（解析到的资源类型/ID、每条下载成功+元数据、跳过原因、`[4/4]` 汇总、多链接总结）；`WARNING`=偶发风控/下载的可恢复重试提示；`ERROR`=真实失败（重试耗尽/异常/参数错误）。原 `print()` 已全部替换为 `logger.xxx`。注意：`download_video` 内的实时进度条仍直接写 stdout（非日志）。CLI 加 `-v/--verbose` 让控制台也降到 DEBUG。
 
 ## 关键坑点（改动前必读）
 

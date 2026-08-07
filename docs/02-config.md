@@ -82,6 +82,23 @@ uv run python -m douyindl "<链接>" -c /path/to/custom-config.yaml
 |------|------|--------|------|
 | `output_dir` | string | `./downloads` | 默认输出根目录，CLI `-o` 参数可覆盖 |
 
+### 日志相关
+
+日志使用 [loguru](https://github.com/Delgan/loguru)，统一双写：**控制台（stderr）+ 文件 `app.log`**。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `log_level` | string | `INFO` | **控制台**日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR`。默认 `INFO`，即控制台只显示结果/警告/错误，`[1/4]~[4/4]` 步骤细节被隐藏 |
+| `log_file` | string | `app.log` | 日志文件路径（相对 cwd）。**文件级别固定 `DEBUG`**，始终记录全部细节（含步骤日志、时间戳、模块:函数:行号），便于事后排查偶发 403 / 下载失败 |
+
+> 日志级别约定（代码内已按此区分）：
+> - **DEBUG**：`[1/4]~[4/4]` 步骤脚手架、视频列表枚举、等待间隔等过程日志
+> - **INFO**：单条结果信息（解析到的资源类型/ID、每条下载成功+元数据、跳过原因、`[4/4]` 完成汇总、多链接总结）
+> - **WARNING**：偶发风控/下载的瞬时可恢复重试提示（区别于最终失败）
+> - **ERROR**：真实失败（重试耗尽、异常、参数错误）
+>
+> 运行时加 `-v/--verbose` 可让控制台也降到 `DEBUG`，显示步骤细节（文件始终为 DEBUG）。
+
 ## 配置覆盖优先级
 
 从高到低：
@@ -128,6 +145,10 @@ progress_db_path: ".douyindl/progress.db"
 
 # 输出相关
 output_dir: "./downloads"
+
+# 日志相关
+log_level: "INFO"
+log_file: "app.log"
 ```
 
 ## 下一步

@@ -85,3 +85,14 @@ progress_db_path: ".douyindl/progress.db"
 
 # 默认输出根目录（CLI -o 参数可覆盖）
 output_dir: "./downloads"
+
+
+# ── 日志相关 ──────────────────────────────────────────────────
+
+# 控制台日志级别（默认 INFO）：DEBUG / INFO / WARNING / ERROR
+# 设为 DEBUG 可在控制台看到 [1/4]~[4/4] 等步骤细节；也可运行时加 -v/--verbose
+# 注：文件 app.log 始终记录 DEBUG 及以上全部细节，便于事后排查
+log_level: "INFO"
+
+# 日志文件路径（默认项目根目录 app.log）；文件级别固定 DEBUG，含完整时间/位置
+log_file: "app.log"

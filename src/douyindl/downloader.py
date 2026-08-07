@@ -63,6 +63,9 @@ from f2.exceptions import (
     APITimeoutError,
 )
 
+# 统一日志出口（loguru）：控制台默认 INFO + 文件 app.log 固定 DEBUG
+from .logger import logger, setup_logger
+
 # ── 配置加载 ────────────────────────────────────────────────────
 
 # 配置文件默认路径（项目根目录下 config/config.yaml）
@@ -154,6 +157,10 @@ class Config:
         self.progress_db_path = data.get("progress_db_path", ".douyindl/progress.db")
 
         self.output_dir = data.get("output_dir", "./downloads")
+
+        # 日志：控制台级别（默认 INFO）、日志文件路径（默认 app.log，文件固定 DEBUG）
+        self.log_level = data.get("log_level", "INFO")
+        self.log_file = data.get("log_file", "app.log")
 
     @property
     def default_headers(self) -> Dict[str, str]:
@@ -309,14 +316,14 @@ async def _request_with_retry(
             if attempt < max_attempts - 1:
                 # 退避 base 取 api_request_interval 与 2s 的较大值，避免过短被识别
                 wait = _random_interval(max(config.api_request_interval, 2.0))
-                print(
-                    f"      {label}遇风控/异常（第{attempt + 1}次），"
+                logger.warning(
+                    f"{label}遇风控/异常（第{attempt + 1}次），"
                     f"{wait:.1f}秒后重试: {_short_err(e)}"
                 )
                 await asyncio.sleep(wait)
             else:
-                print(
-                    f"      {label}重试 {max_attempts} 次仍失败: {_short_err(e)}"
+                logger.error(
+                    f"{label}重试 {max_attempts} 次仍失败: {_short_err(e)}"
                 )
     assert last_exc is not None
     raise last_exc
@@ -711,7 +718,7 @@ async def download_metadata(
             try:
                 await _download_simple(cover_url, base_path.with_suffix(".jpg"), config)
             except Exception as e:
-                print(f"      封面下载失败: {e}")
+                logger.warning(f"封面下载失败: {e}")
 
     # 文案全文
     if config.save_desc:
@@ -728,7 +735,7 @@ async def download_metadata(
                 try:
                     await _download_simple(music_url, base_path.with_suffix(".mp3"), config)
                 except Exception as e:
-                    print(f"      原声下载失败: {e}")
+                    logger.warning(f"原声下载失败: {e}")
 
     # 完整视频信息 JSON
     if config.save_json:
@@ -1054,12 +1061,15 @@ class DouyinDownloader:
             except Exception as e:
                 last_error = str(e)
                 if attempt < cfg.download_max_retries:
-                    print(f"      下载失败（第{attempt+1}次尝试），"
-                          f"{cfg.download_retry_interval}秒后重试: {e}")
+                    logger.warning(
+                        f"下载失败（第{attempt+1}次尝试），"
+                        f"{cfg.download_retry_interval}秒后重试: {e}"
+                    )
                     await asyncio.sleep(cfg.download_retry_interval)
                 else:
-                    print(f"      下载失败（共尝试{max_attempts}次，"
-                          f"已用尽重试次数）: {e}")
+                    logger.error(
+                        f"下载失败（共尝试{max_attempts}次，已用尽重试次数）: {e}"
+                    )
         return False, last_error, attempt
 
     async def retry_failed(self) -> Dict[str, Any]:
@@ -1075,27 +1085,27 @@ class DouyinDownloader:
             统计字典，含 total/success/still_failed
         """
         cfg = self.config
-        print("[retry-failed] 开始重试数据库中的失败记录...")
+        logger.info("[retry-failed] 开始重试数据库中的失败记录...")
 
         db = self._get_progress_db()
         if db is None:
-            print("错误: 进度数据库未启用，无法查询失败记录", file=sys.stderr)
+            logger.error("进度数据库未启用，无法查询失败记录")
             return {"total": 0, "success": 0, "still_failed": 0}
 
         with db as progress_db:
             failed_list = progress_db.query_failed()
 
         if not failed_list:
-            print("没有失败记录需要重试")
+            logger.info("没有失败记录需要重试")
             return {"total": 0, "success": 0, "still_failed": 0}
 
         total = len(failed_list)
-        print(f"共 {total} 条失败记录需要重试:")
+        logger.info(f"共 {total} 条失败记录需要重试:")
         for i, r in enumerate(failed_list, 1):
             desc_short = (r.get("desc") or "").replace("\n", " ")[:40]
-            print(f"  {i:>3d}. [{r['aweme_id']}] {desc_short}")
+            logger.debug(f"  {i:>3d}. [{r['aweme_id']}] {desc_short}")
             if r.get("error_msg"):
-                print(f"       上次错误: {r['error_msg'][:80]}")
+                logger.debug(f"       上次错误: {r['error_msg'][:80]}")
 
         success = 0
         still_failed = 0
@@ -1108,13 +1118,13 @@ class DouyinDownloader:
                 resource_id = r.get("resource_id") or aweme_id
                 resource_type = r.get("resource_type") or "one"
 
-                print(f"\n  [{i}/{total}] 重试 {aweme_id}")
+                logger.debug(f"[{i}/{total}] 重试 {aweme_id}")
 
                 # 重新获取视频下载地址（旧地址可能已失效）
                 try:
                     video = await fetch_one_video(str(aweme_id), cfg)
                 except Exception as e:
-                    print(f"      获取视频信息失败: {e}")
+                    logger.error(f"获取视频信息失败: {e}")
                     # API 失败也记录到 db，更新 error_msg（meta 无法获取，置 None）
                     progress_db.record(
                         aweme_id=str(aweme_id),
@@ -1135,7 +1145,7 @@ class DouyinDownloader:
                 if isinstance(play_addr, list):
                     play_addr = play_addr[0] if play_addr else None
                 if not play_addr:
-                    print(f"      无视频地址，跳过")
+                    logger.info(f"无视频地址，跳过")
                     progress_db.record(
                         aweme_id=str(aweme_id),
                         resource_type=resource_type,
@@ -1201,10 +1211,10 @@ class DouyinDownloader:
                 # 间隔时间在 base*0.9 到 base 之间随机取数
                 if i < total and cfg.mix_download_interval > 0:
                     actual_interval = _random_interval(cfg.mix_download_interval)
-                    print(f"      等待 {actual_interval:.1f} 秒后继续...")
+                    logger.debug(f"等待 {actual_interval:.1f} 秒后继续...")
                     await asyncio.sleep(actual_interval)
 
-        print(f"\n[retry-failed] 完成: 成功 {success}/{total}，仍失败 {still_failed}")
+        logger.info(f"[retry-failed] 完成: 成功 {success}/{total}，仍失败 {still_failed}")
         return {
             "total": total,
             "success": success,
@@ -1233,42 +1243,42 @@ class DouyinDownloader:
         # 下载当日日期，用于目录名 / 单视频文件名前缀
         date_str = datetime.now().strftime("%Y%m%d")
 
-        print(f"[1/4] 解析分享链接: {share_url}")
+        logger.debug(f"[1/4] 解析分享链接: {share_url}")
         kind, resource_id = await resolve_share_url(share_url, cfg)
 
         # mix_name 在两种场景下都需初始化，用于进度记录
         mix_name = ""
         if kind == "mix":
-            print(f"      检测到合集链接, mix_id={resource_id}")
+            logger.info(f"检测到合集链接, mix_id={resource_id}")
             mix_name, videos = await fetch_mix_videos(
                 resource_id,
                 config=cfg,
                 max_counts=self.max_counts,
             )
             if mix_name:
-                print(f"      合集名称: {mix_name}")
+                logger.info(f"合集名称: {mix_name}")
 
             # 合集：创建子目录 YYYYMMDD_合集名
             safe_name = _sanitize_filename(mix_name, cfg.filename_max_len) or resource_id
             target_dir = self.output_dir / f"{date_str}_{safe_name}"
             download_interval = cfg.mix_download_interval
         else:
-            print(f"      检测到单视频链接, aweme_id={resource_id}")
+            logger.info(f"检测到单视频链接, aweme_id={resource_id}")
             videos = [await fetch_one_video(resource_id, cfg)]
             # 单视频直接下载到 output_dir
             target_dir = self.output_dir
             download_interval = 0
 
-        print(f"[2/4] 共获取 {len(videos)} 个视频:")
+        logger.debug(f"[2/4] 共获取 {len(videos)} 个视频:")
         for i, v in enumerate(videos, 1):
             desc = (v.get("desc") or "").replace("\n", " ")[:40]
-            print(f"  {i:>3d}. [{v.get('aweme_id')}] {desc}")
+            logger.debug(f"  {i:>3d}. [{v.get('aweme_id')}] {desc}")
 
         # 打开进度数据库（上下文管理器确保连接关闭）
         db = self._get_progress_db()
         db_ctx = db if db is not None else _NullContext()
 
-        print(f"[3/4] 开始下载到 {target_dir}/ ...")
+        logger.debug(f"[3/4] 开始下载到 {target_dir}/ ...")
         target_dir.mkdir(parents=True, exist_ok=True)
         success = 0
         skipped = 0
@@ -1282,7 +1292,7 @@ class DouyinDownloader:
                     play_addr = play_addr[0] if play_addr else None
 
                 if not play_addr:
-                    print(f"  [{i}/{len(videos)}] {aweme_id} 无视频地址，跳过")
+                    logger.info(f"[{i}/{len(videos)}] {aweme_id} 无视频地址，跳过")
                     continue
 
                 name = _build_video_name(desc, str(aweme_id), cfg.filename_max_len)
@@ -1298,16 +1308,16 @@ class DouyinDownloader:
                 # 注意：失败记录（status='failed'）不跳过，会重新下载
                 if not self.force:
                     if save_path.exists():
-                        print(f"  [{i}/{len(videos)}] {save_path.name} 文件已存在，跳过")
+                        logger.info(f"[{i}/{len(videos)}] {save_path.name} 文件已存在，跳过")
                         success += 1
                         skipped += 1
                         continue
                     if progress_db and progress_db.is_success_downloaded(str(aweme_id)):
-                        print(f"  [{i}/{len(videos)}] {save_path.name} 进度记录已存在，跳过")
+                        logger.info(f"[{i}/{len(videos)}] {save_path.name} 进度记录已存在，跳过")
                         skipped += 1
                         continue
 
-                print(f"  [{i}/{len(videos)}] 下载 {save_path.name}")
+                logger.info(f"[{i}/{len(videos)}] 下载 {save_path.name}")
                 # 下载重试：失败时自动重试 download_max_retries 次（0 表示不重试）
                 download_ok, last_error, attempt = await self._download_with_retry(
                     play_addr, save_path
@@ -1336,7 +1346,7 @@ class DouyinDownloader:
                         if meta.get("is_h265"):
                             info_parts.append("H.265")
                         if info_parts:
-                            print(f"      元数据: {', '.join(info_parts)}")
+                            logger.info(f"元数据: {', '.join(info_parts)}")
 
                     # 下载元数据（封面/文案/原声/JSON）
                     if cfg.save_metadata:
@@ -1380,15 +1390,15 @@ class DouyinDownloader:
                 # 间隔时间在 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别
                 if download_interval and i < len(videos):
                     actual_interval = _random_interval(download_interval)
-                    print(f"      等待 {actual_interval:.1f} 秒后继续下载下一个...")
+                    logger.debug(f"等待 {actual_interval:.1f} 秒后继续下载下一个...")
                     await asyncio.sleep(actual_interval)
 
         # 统计输出
-        print(f"\n[4/4] 完成: 成功 {success}/{len(videos)}，跳过 {skipped}")
-        print(f"      保存目录: {target_dir}/")
+        logger.info(f"[4/4] 完成: 成功 {success}/{len(videos)}，跳过 {skipped}")
+        logger.info(f"保存目录: {target_dir}/")
         if progress_db and kind == "mix":
             total = progress_db.count_by_resource(resource_id)
-            print(f"      合集 {resource_id} 累计已下载 {total} 个视频（含历史记录）")
+            logger.info(f"合集 {resource_id} 累计已下载 {total} 个视频（含历史记录）")
         return {
             "url": share_url,
             "kind": kind,
@@ -1462,6 +1472,11 @@ def main():
         help="重试数据库中所有下载失败的记录（status='failed'），无需提供 url/-i",
     )
     parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="详细模式：控制台日志级别降为 DEBUG，显示 [1/4]~[4/4] 等步骤细节（默认 INFO）",
+    )
+    parser.add_argument(
         "-m", "--metadata",
         nargs="?", const="all", default=None,
         help="保存元数据，可选类型: all/cover/desc/music/json（逗号分隔多个）；"
@@ -1472,6 +1487,13 @@ def main():
     # 加载配置
     config_path = Path(args.config) if args.config else None
     config = Config(config_path)
+
+    # 配置日志：控制台级别由 config.log_level 控制（默认 INFO），文件 app.log 固定 DEBUG
+    # -v/--verbose 可让控制台也显示 DEBUG 步骤细节（否则步骤日志仅写入 app.log）
+    setup_logger(
+        level="DEBUG" if args.verbose else config.log_level,
+        log_file=config.log_file,
+    )
 
     # CLI -m 参数精细控制元数据子开关
     # - 未指定 -m：沿用 config.yaml 设置
@@ -1485,7 +1507,7 @@ def main():
         valid = {"cover", "desc", "music", "json", "all"}
         invalid = wanted - valid
         if invalid:
-            print(f"错误: 未知的元数据类型 {invalid}，可选: {valid}", file=sys.stderr)
+            logger.error(f"未知的元数据类型 {invalid}，可选: {valid}")
             sys.exit(1)
         config.save_metadata = True
         config.save_cover = meta_all or "cover" in wanted
@@ -1513,17 +1535,17 @@ def main():
     if args.input_file:
         input_path = Path(args.input_file)
         if not input_path.exists():
-            print(f"错误: 输入文件不存在: {input_path}", file=sys.stderr)
+            logger.error(f"输入文件不存在: {input_path}")
             sys.exit(1)
         file_content = input_path.read_text(encoding="utf-8")
         if not file_content.strip():
-            print(f"错误: 输入文件内容为空: {input_path}", file=sys.stderr)
+            logger.error(f"输入文件内容为空: {input_path}")
             sys.exit(1)
         raw_texts.append(file_content)
 
     if not raw_texts:
-        print("错误: 未提供分享链接，请通过 url 参数或 -i/--input-file 指定，"
-              "或使用 -r/--retry-failed 重试失败记录", file=sys.stderr)
+        logger.error("未提供分享链接，请通过 url 参数或 -i/--input-file 指定，"
+                     "或使用 -r/--retry-failed 重试失败记录")
         sys.exit(1)
 
     # 从所有文本来源中提取 URL（支持空格/换行分隔多链接）
@@ -1537,7 +1559,7 @@ def main():
     urls = list(dict.fromkeys(urls))
 
     if not urls:
-        print("错误: 未在输入中找到有效的 URL", file=sys.stderr)
+        logger.error("未在输入中找到有效的 URL")
         sys.exit(1)
 
     # 多链接串行下载（asyncio.run 只能调用一次，包一层协程循环）
@@ -1546,13 +1568,13 @@ def main():
         results: List[Dict[str, Any]] = []
         for i, url in enumerate(urls, 1):
             if total > 1:
-                print(f"\n========== [{i}/{total}] {url} ==========")
+                logger.debug(f"========== [{i}/{total}] {url} ==========")
             try:
                 stat = await dl.run(url)
                 results.append(stat)
             except Exception as e:
                 # 单个链接失败不中断后续链接
-                print(f"      下载失败: {e}", file=sys.stderr)
+                logger.error(f"下载失败: {e}")
                 results.append({
                     "url": url, "kind": "", "resource_id": "", "mix_name": "",
                     "total": 0, "success": 0, "skipped": 0, "target_dir": "",
@@ -1562,7 +1584,7 @@ def main():
             # 间隔时间在 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别
             if i < total and config.mix_download_interval > 0:
                 actual_interval = _random_interval(config.mix_download_interval)
-                print(f"\n等待 {actual_interval:.1f} 秒后继续下载下一个链接...")
+                logger.debug(f"等待 {actual_interval:.1f} 秒后继续下载下一个链接...")
                 await asyncio.sleep(actual_interval)
 
         # 多链接下载总结
@@ -1571,7 +1593,7 @@ def main():
             sum_skipped = sum(r.get("skipped", 0) for r in results)
             sum_total = sum(r.get("total", 0) for r in results)
             failed_links = [r["url"] for r in results if r.get("error")]
-            print("\n========== 多链接下载总结 ==========")
+            logger.info("========== 多链接下载总结 ==========")
             for i, r in enumerate(results, 1):
                 kind_label = "合集" if r.get("kind") == "mix" else (
                     "单视频" if r.get("kind") == "one" else "失败"
@@ -1580,12 +1602,11 @@ def main():
                 status = f"成功 {r.get('success', 0)}/{r.get('total', 0)}，跳过 {r.get('skipped', 0)}"
                 if r.get("error"):
                     status = f"失败: {r['error']}"
-                print(f"  [{i}/{total}] {kind_label} {name} - {status}")
-            print(f"  合计: 成功 {sum_success}/{sum_total}，跳过 {sum_skipped}", end="")
+                logger.info(f"  [{i}/{total}] {kind_label} {name} - {status}")
             if failed_links:
-                print(f"，失败 {len(failed_links)} 个链接")
+                logger.info(f"  合计: 成功 {sum_success}/{sum_total}，跳过 {sum_skipped}，失败 {len(failed_links)} 个链接")
             else:
-                print()
+                logger.info(f"  合计: 成功 {sum_success}/{sum_total}，跳过 {sum_skipped}")
 
     asyncio.run(run_all())
 
