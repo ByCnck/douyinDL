@@ -77,6 +77,7 @@ douyinDL/
 - **`resolve_share_url`**：支持短链 `v.douyin.com`、合集 `iesdouyin.com/share/mix/detail/{id}` 或 `douyin.com/collection/{id}`、单视频 `douyin.com/video/{id}`；短链跟随重定向后用正则 `_MIX_PATH_PATTERN` / `_AWEME_ID_PATTERN` 提取 `mix`/`one` 类型与 ID。
 - **匿名认证**：`build_cookie()` 用 `TokenManager.gen_ttwid()` + `gen_false_msToken()` 拼 cookie，无需登录。
 - **视频列表**：`fetch_mix_videos`（分页循环，受 `page_counts`/`api_request_interval` 节流）与 `fetch_one_video`，分别用 f2 的 `UserMixFilter._to_list()` 与 `PostDetailFilter._to_dict()`。
+- **API 请求重试层**：`fetch_one_video` 与 `fetch_mix_videos` 的接口调用统一经 `_request_with_retry` 包裹。原因：f2 的 `base_crawler.handle_http_status_error` 对 403/429/5xx 等 HTTP 状态错误是 `else` 分支**直接抛异常、不进入重试循环**（它只在响应为空时才重试）。抖音对 `aweme/detail` 等接口存在**间歇性风控（偶发 403 Forbidden）**，表现为批量下载时零星失败——而换新会话（换 PC 链接/重跑）往往就成功。本层补上重试：**每次重试都重新生成匿名 ttwid cookie（换会话）**，退避用 `_random_interval(max(api_request_interval, 2.0))`，仅对 `APIResponseError`/`APIRateLimitError`/`APIConnectionError`/`APITimeoutError` 重试，逻辑错误不重试。重试次数由 `config.api_max_retries`（默认 3）控制。
 - **`_extract_video_meta`**：f2 filter 会丢失 `video.*` 嵌套字段，此函数从原始 JSON 补提（duration/width/height/file_size/bit_rate/fps/ratio/video_format/is_h265/作者/统计/创建时间），用于入库。
 - **下载**：`download_video` 用 httpx 流式下载，**注意其内部 `AsyncClient(timeout=60)` 是硬编码，并不读取 `config.timeout`**；限速由 `max_download_speed`（字节/秒，0=不限）按累计字节数节流。`_download_simple` 用于小文件（封面/原声）。
 - **`ProgressDB`**：SQLite 表 `downloaded_videos`，主键 `aweme_id`；`_migrate_schema` 用 `PRAGMA table_info` 检测缺失列并 `ALTER TABLE ADD COLUMN` 做版本迁移（兼容 v0.3→v0.5 旧库）。`status` 字段记录 `success`/`failed`，失败不跳过、可重跑。
@@ -90,6 +91,7 @@ douyinDL/
 - **`timeout` 不一致**：`config.timeout`（默认 15s）用于 API/链接解析；视频下载用硬编码 60s。调超时注意区分。
 - **`max_tasks=1`**：`config.yaml` 默认单任务，控制并发不要盲目调高以免触发风控。
 - **`video_play_addr` 可能为空或列表**：代码已处理（取列表首项），新增下载逻辑时注意判空。
+- **`aweme/detail` 偶发 403 是风控、不是 bug**：抖音对单视频详情/合集列表接口有间歇性风控，批量下载时零星返回 `403 Forbidden`。f2 自身对该类 HTTP 状态错误**不重试**（直接抛 `APIResponseError`），所以此前会直接失败。`fetch_one_video`/`fetch_mix_videos` 已用 `_request_with_retry` 补上带抖动退避的重试（每次换新 ttwid 会话），重现「换 PC 链接重跑就成功」的效果。若仍失败，可用 `--retry-failed` 在进度库里重跑失败记录（会再次换新会话重试）。调大 `config.api_max_retries` 可提高成功率，但过高会增加被风控识别的概率，慎用。
 - **`_meta` 来自原始响应**：f2 filter 不提供完整元数据，任何依赖分辨率/码率/时长的地方都要走 `_extract_video_meta`。
 - **进度库相对路径**：`ProgressDB` 路径相对当前工作目录解析（CLI 运行时 cwd=项目根）。非 CLI 调用时注意 cwd。
 - **`downloads/` 与 `.douyindl/`** 是运行产物，已下载视频/进度库不要误删；`downloads/` 下 72 个 mp4 为既有成果。

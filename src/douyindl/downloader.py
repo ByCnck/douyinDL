@@ -55,6 +55,13 @@ from f2.apps.douyin.crawler import DouyinCrawler
 from f2.apps.douyin.model import UserMix, PostDetail
 from f2.apps.douyin.filter import UserMixFilter, PostDetailFilter
 from f2.apps.douyin.utils import TokenManager
+# f2 的 API 异常（403/429/网络/超时等都会转成这些，便于在业务层精准重试）
+from f2.exceptions import (
+    APIResponseError,
+    APIRateLimitError,
+    APIConnectionError,
+    APITimeoutError,
+)
 
 # ── 配置加载 ────────────────────────────────────────────────────
 
@@ -122,6 +129,8 @@ class Config:
 
         self.page_counts = int(data.get("page_counts", 20))
         self.api_request_interval = float(data.get("api_request_interval", 2.0))
+        # API 层重试次数（针对抖音间歇性风控 403/429/5xx 的兜底；f2 自身不重试这类错误）
+        self.api_max_retries = int(data.get("api_max_retries", 3))
 
         self.mix_download_interval = int(data.get("mix_download_interval", 60))
         self.chunk_size = int(data.get("chunk_size", 65536))
@@ -249,6 +258,86 @@ def build_crawler_kwargs(cookie: str, config: Config) -> Dict[str, Any]:
     }
 
 
+# ── API 请求重试（抖音间歇性风控 403 的兜底） ──────────────────────
+
+def _short_err(e: Exception, limit: int = 160) -> str:
+    """截断异常信息，避免把超长的抖音 API URL 整段打印到终端。"""
+    s = str(e)
+    return s if len(s) <= limit else s[:limit] + "..."
+
+
+async def _request_with_retry(
+    fetch_factory,
+    config: Config,
+    label: str = "API 请求",
+):
+    """对抖音 API 请求做带抖动退避的重试。
+
+    背景：f2 的 base_crawler 在收到 403/429/5xx 等 HTTP 状态错误时会**直接抛异常、
+    不进入重试循环**（它只在「响应内容为空」时才重试）。抖音对 aweme/detail 等接口
+    存在间歇性风控（偶发 403 Forbidden），表现为批量下载时零星失败——而换一条 PC
+    链接（新会话）重新跑往往就能成功。因此这里在业务层补一层重试。
+
+    - 每次重试都重新生成匿名 cookie（新 ttwid），相当于「换新会话」，规避被同一
+      会话风控标记。
+    - 退避间隔使用 _random_interval（[base*0.9, base] 随机），避免固定节奏被识别。
+    - 仅对瞬态错误（403/429/5xx/网络/超时）重试，逻辑错误（如取不到视频）不重试。
+
+    Args:
+        fetch_factory: 接收 kwargs(dict) 并返回协程的函数；每次重试都会以全新
+            kwargs（新 cookie）调用它，得到一个全新协程。
+        config: 配置对象（使用 api_max_retries / api_request_interval）
+        label: 日志前缀，便于区分是哪类请求在重试
+
+    Returns:
+        被调协程的返回值（视频字典 / 合集响应）
+    """
+    last_exc: Optional[Exception] = None
+    max_attempts = max(1, config.api_max_retries)
+    for attempt in range(max_attempts):
+        try:
+            cookie = build_cookie()
+            kwargs = build_crawler_kwargs(cookie, config)
+            return await fetch_factory(kwargs)
+        except (
+            APIResponseError,   # 403/5xx 等 HTTP 状态错误
+            APIRateLimitError,  # 429 频率限制
+            APIConnectionError,  # 网络异常
+            APITimeoutError,     # 超时
+        ) as e:
+            last_exc = e
+            if attempt < max_attempts - 1:
+                # 退避 base 取 api_request_interval 与 2s 的较大值，避免过短被识别
+                wait = _random_interval(max(config.api_request_interval, 2.0))
+                print(
+                    f"      {label}遇风控/异常（第{attempt + 1}次），"
+                    f"{wait:.1f}秒后重试: {_short_err(e)}"
+                )
+                await asyncio.sleep(wait)
+            else:
+                print(
+                    f"      {label}重试 {max_attempts} 次仍失败: {_short_err(e)}"
+                )
+    assert last_exc is not None
+    raise last_exc
+
+
+def _make_mix_call(params):
+    """构造合集列表请求的协程工厂（供 _request_with_retry 使用）。"""
+    async def _call(kwargs):
+        async with DouyinCrawler(kwargs) as crawler:
+            return await crawler.fetch_user_mix(params)
+    return _call()
+
+
+def _make_post_detail_call(params):
+    """构造单视频详情请求的协程工厂（供 _request_with_retry 使用）。"""
+    async def _call(kwargs):
+        async with DouyinCrawler(kwargs) as crawler:
+            return await crawler.fetch_post_detail(params)
+    return _call()
+
+
 # ── 合集视频列表获取 ────────────────────────────────────────────
 
 def _extract_mix_name(response: Any) -> str:
@@ -295,11 +384,11 @@ async def fetch_mix_videos(
 
     while len(collected) < limit:
         current_size = min(config.page_counts, limit - len(collected))
-        async with DouyinCrawler(kwargs) as crawler:
-            params = UserMix(
-                cursor=cursor, count=current_size, mix_id=mix_id
-            )
-            response = await crawler.fetch_user_mix(params)
+        params = UserMix(cursor=cursor, count=current_size, mix_id=mix_id)
+        # 合集列表接口同样会被抖音间歇性风控 403，走统一重试层兜底
+        response = await _request_with_retry(
+            _make_mix_call(params), config, label="获取合集列表"
+        )
 
         # 从第一页响应中提取合集名
         if not mix_name:
@@ -338,23 +427,28 @@ async def fetch_one_video(aweme_id: str, config: Config) -> Dict[str, Any]:
     返回的字典额外包含 _meta 子字典（duration/width/height/file_size/
     bit_rate/fps/ratio/video_format/is_h265 等视频元数据）。
     """
-    cookie = build_cookie()
-    kwargs = build_crawler_kwargs(cookie, config)
+    params = PostDetail(aweme_id=aweme_id)
 
-    async with DouyinCrawler(kwargs) as crawler:
-        params = PostDetail(aweme_id=aweme_id)
-        response = await crawler.fetch_post_detail(params)
-        video = PostDetailFilter(response)
+    def _factory(kwargs):
+        async def _call():
+            async with DouyinCrawler(kwargs) as crawler:
+                response = await crawler.fetch_post_detail(params)
+            video = PostDetailFilter(response)
+            # PostDetailFilter._to_dict() 返回单个视频字典
+            item = video._to_dict()
+            if not item:
+                raise ValueError(f"未获取到视频信息，aweme_id={aweme_id}")
+            # 从原始响应提取视频元数据
+            aweme_detail = (
+                response.get("aweme_detail", {}) if isinstance(response, dict) else {}
+            )
+            item["_meta"] = _extract_video_meta(aweme_detail)
+            return item
+        return _call()
 
-    # PostDetailFilter._to_dict() 返回单个视频字典
-    item = video._to_dict()
-    if not item:
-        raise ValueError(f"未获取到视频信息，aweme_id={aweme_id}")
-
-    # 从原始响应提取视频元数据
-    aweme_detail = response.get("aweme_detail", {}) if isinstance(response, dict) else {}
-    item["_meta"] = _extract_video_meta(aweme_detail)
-    return item
+    # aweme/detail 接口会被抖音间歇性风控 403，走统一重试层兜底
+    # （每次重试都换新 ttwid，等价于「换 PC 链接重跑」能成功的情况）
+    return await _request_with_retry(_factory, config, label="获取视频详情")
 
 
 def _extract_video_meta(aweme: Dict[str, Any]) -> Dict[str, Any]:

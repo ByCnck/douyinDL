@@ -22,7 +22,7 @@ uv run python -m douyindl "<链接>" -c /path/to/custom-config.yaml
 |------|------|--------|------|
 | `user_agent` | string | Chrome 130 Edg 130 UA | 必须与 f2 内部 UA 一致，否则 a_bogus 签名校验失败 |
 | `timeout` | int | 15 | HTTP 请求超时（秒） |
-| `max_retries` | int | 5 | API 请求最大重试次数 |
+| `max_retries` | int | 5 | f2 crawler 内部重试次数（仅当「响应内容为空」时重试，**对 403/429/5xx 不重试**） |
 | `max_tasks` | int | 1 | f2 crawler 内部信号量上限，控制并发 |
 | `max_connections` | int | 5 | httpx 连接池大小 |
 
@@ -34,6 +34,9 @@ uv run python -m douyindl "<链接>" -c /path/to/custom-config.yaml
 |------|------|--------|------|
 | `page_counts` | int | 10 | 合集 API 分页每页条数，不建议超过 20，可能触发风控 |
 | `api_request_interval` | float | 2.0 | API 分页请求间隔（秒），避免抖音风控 |
+| `api_max_retries` | int | 3 | **业务层 API 重试次数**：针对抖音对 `aweme/detail`/合集列表的间歇性风控（偶发 403/429/5xx）。f2 自身不重试这类错误，这里在业务层补一层带随机抖动退避的重试，每次重试都重新生成匿名 ttwid 会话（等价于「换 PC 链接重跑」能成功）。0 表示不重试 |
+
+> 抖音会在批量下载时对单视频/合集接口偶发返回 403 Forbidden，这是风控而非接口故障。设置 `api_max_retries ≥ 1` 后，失败的请求会自动换新会话重试，通常随即成功。若仍失败，可运行 `-r/--retry-failed` 在进度库中重跑失败记录（同样会换新会话重试）。`api_request_interval` 同时作为重试退避的基准（取与 2.0 的较大值再随机抖动）。
 
 合集视频数超过 `page_counts` 时会自动翻页，每页之间等待 `api_request_interval` 秒。
 
@@ -102,6 +105,7 @@ max_connections: 5
 # 抖音 API 调用相关
 page_counts: 10
 api_request_interval: 2.0
+api_max_retries: 3
 
 # 视频下载相关
 mix_download_interval: 60
