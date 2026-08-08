@@ -1283,7 +1283,13 @@ class DouyinDownloader:
         success = 0
         skipped = 0
         with db_ctx as progress_db:
+            # 仅合集（多视频）才显示 [i/N] 序号；单视频无需序号，避免 [1/1] 误导
+            show_idx = len(videos) > 1
             for i, v in enumerate(videos, 1):
+                # 视频之间空行分隔，提升可读性（首条不加）
+                if i > 1:
+                    logger.info("")
+
                 aweme_id = v.get("aweme_id", f"unknown_{i}")
                 desc = v.get("desc") or ""
                 play_addr = v.get("video_play_addr")
@@ -1291,8 +1297,10 @@ class DouyinDownloader:
                 if isinstance(play_addr, list):
                     play_addr = play_addr[0] if play_addr else None
 
+                idx = f"[{i}/{len(videos)}] " if show_idx else ""
+
                 if not play_addr:
-                    logger.info(f"[{i}/{len(videos)}] {aweme_id} 无视频地址，跳过")
+                    logger.info(f"{idx}{aweme_id} 无视频地址，跳过")
                     continue
 
                 name = _build_video_name(desc, str(aweme_id), cfg.filename_max_len)
@@ -1308,16 +1316,16 @@ class DouyinDownloader:
                 # 注意：失败记录（status='failed'）不跳过，会重新下载
                 if not self.force:
                     if save_path.exists():
-                        logger.info(f"[{i}/{len(videos)}] {save_path.name} 文件已存在，跳过")
+                        logger.info(f"{idx}{save_path.name} 文件已存在，跳过")
                         success += 1
                         skipped += 1
                         continue
                     if progress_db and progress_db.is_success_downloaded(str(aweme_id)):
-                        logger.info(f"[{i}/{len(videos)}] {save_path.name} 进度记录已存在，跳过")
+                        logger.info(f"{idx}{save_path.name} 进度记录已存在，跳过")
                         skipped += 1
                         continue
 
-                logger.info(f"[{i}/{len(videos)}] 下载 {save_path.name}")
+                logger.info(f"{idx}下载 {save_path.name}")
                 # 下载重试：失败时自动重试 download_max_retries 次（0 表示不重试）
                 download_ok, last_error, attempt = await self._download_with_retry(
                     play_addr, save_path
@@ -1346,7 +1354,7 @@ class DouyinDownloader:
                         if meta.get("is_h265"):
                             info_parts.append("H.265")
                         if info_parts:
-                            logger.info(f"元数据: {', '.join(info_parts)}")
+                            logger.info(f"元数据: {' · '.join(info_parts)}")
 
                     # 下载元数据（封面/文案/原声/JSON）
                     if cfg.save_metadata:
@@ -1394,11 +1402,15 @@ class DouyinDownloader:
                     await asyncio.sleep(actual_interval)
 
         # 统计输出
-        logger.info(f"[4/4] 完成: 成功 {success}/{len(videos)}，跳过 {skipped}")
-        logger.info(f"保存目录: {target_dir}/")
+        # [4/4] 步骤标记仅在 DEBUG 显示（与 [1/4]~[3/4] 成组）；
+        # INFO 层只输出干净的完成汇总，避免默认控制台出现孤立的 [4/4]
+        logger.debug(f"[4/4] 完成: 成功 {success}/{len(videos)}，跳过 {skipped}")
+        logger.info(f"完成: 成功 {success}/{len(videos)}，跳过 {skipped}")
+        # 保存目录属于细节信息，归入 DEBUG（默认控制台不显示，避免每条链接重复刷屏）
+        logger.debug(f"保存目录: {target_dir}/")
         if progress_db and kind == "mix":
-            total = progress_db.count_by_resource(resource_id)
-            logger.info(f"合集 {resource_id} 累计已下载 {total} 个视频（含历史记录）")
+            cum = progress_db.count_by_resource(resource_id)
+            logger.info(f"合集 {resource_id} 累计已下载 {cum} 个视频（含历史记录）")
         return {
             "url": share_url,
             "kind": kind,
@@ -1568,6 +1580,9 @@ def main():
         results: List[Dict[str, Any]] = []
         for i, url in enumerate(urls, 1):
             if total > 1:
+                # 链接之间空行分隔，提升可读性（首条不加）
+                if i > 1:
+                    logger.info("")
                 logger.debug(f"========== [{i}/{total}] {url} ==========")
             try:
                 stat = await dl.run(url)
@@ -1589,6 +1604,7 @@ def main():
 
         # 多链接下载总结
         if total > 1:
+            logger.info("")
             sum_success = sum(r.get("success", 0) for r in results)
             sum_skipped = sum(r.get("skipped", 0) for r in results)
             sum_total = sum(r.get("total", 0) for r in results)

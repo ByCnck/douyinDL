@@ -19,6 +19,23 @@ from loguru import logger as _logger
 _initialized = False
 
 
+def _console_format(record) -> str:
+    """控制台格式：空消息渲染为纯空行（用于视频/链接之间的视觉分隔）。"""
+    if not record["message"]:
+        return "\n"
+    return "<level>{level: <8}</level> | {message}\n"
+
+
+def _file_format(record) -> str:
+    """文件格式：空消息渲染为纯空行；非空时带时间/级别/位置，便于排查。"""
+    if not record["message"]:
+        return "\n"
+    return (
+        "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
+        "{name}:{function}:{line} | {message}\n"
+    )
+
+
 def setup_logger(level: str = "INFO", log_file: str = "app.log") -> None:
     """配置全局 logger。
 
@@ -36,9 +53,7 @@ def setup_logger(level: str = "INFO", log_file: str = "app.log") -> None:
         sys.stderr,
         level=level,
         colorize=True,
-        format=(
-            "<level>{level: <8}</level> | {message}"
-        ),
+        format=_console_format,
     )
 
     # ── 文件：固定 DEBUG，完整格式（时间/级别/模块:函数:行号），自动轮转 ──
@@ -49,10 +64,7 @@ def setup_logger(level: str = "INFO", log_file: str = "app.log") -> None:
         rotation="10 MB",
         retention=5,
         enqueue=True,
-        format=(
-            "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
-            "{name}:{function}:{line} | {message}"
-        ),
+        format=_file_format,
     )
     _initialized = True
 

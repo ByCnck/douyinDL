@@ -83,7 +83,8 @@ douyinDL/
 - **`ProgressDB`**：SQLite 表 `downloaded_videos`，主键 `aweme_id`；`_migrate_schema` 用 `PRAGMA table_info` 检测缺失列并 `ALTER TABLE ADD COLUMN` 做版本迁移（兼容 v0.3→v0.5 旧库）。`status` 字段记录 `success`/`failed`，失败不跳过、可重跑。
 - **`DouyinDownloader`**：主流程 `run()`（解析→拉列表→下载→入库），`_download_with_retry`（受 `download_max_retries`）、`retry_failed()`（查失败记录→重新取地址→下载→更新库）。`main()` 为 CLI 入口，多链接串行、去重、下载后清空 `-i` 文件。
 - **风控**：合集视频间隔、多链接间隔、失败重试间隔均通过 `_random_interval(base)` 在 `[base*0.9, base]` 随机取值，避免固定间隔被识别。
-- **日志（loguru，双写）**：`src/douyindl/logger.py` 的 `setup_logger()` 配置两个 sink——**控制台（stderr）级别由 `config.log_level` 控制（默认 INFO）** + **文件 `app.log` 固定 DEBUG**。代码内已按级别区分：`DEBUG`=`[1/4]~[4/4]` 步骤脚手架/列表枚举/等待间隔；`INFO`=单条结果（解析到的资源类型/ID、每条下载成功+元数据、跳过原因、`[4/4]` 汇总、多链接总结）；`WARNING`=偶发风控/下载的可恢复重试提示；`ERROR`=真实失败（重试耗尽/异常/参数错误）。原 `print()` 已全部替换为 `logger.xxx`。注意：`download_video` 内的实时进度条仍直接写 stdout（非日志）。CLI 加 `-v/--verbose` 让控制台也降到 DEBUG。
+- **日志（loguru，双写）**：`src/douyindl/logger.py` 的 `setup_logger()` 配置两个 sink——**控制台（stderr）级别由 `config.log_level` 控制（默认 INFO）** + **文件 `app.log` 固定 DEBUG**。代码内已按级别区分：`DEBUG`=`[1/4]~[4/4]` 步骤脚手架/列表枚举/等待间隔（含 `[4/4] 完成` 步骤标记）、`保存目录` 路径、合集累计下载数等细节；`INFO`=单条结果（解析到的资源类型/ID、每条下载成功+元数据、跳过原因、完成汇总 `完成: 成功 X/N，跳过 Y`、多链接总结）；`WARNING`=偶发风控/下载的可恢复重试提示；`ERROR`=真实失败（重试耗尽/异常/参数错误）。原 `print()` 已全部替换为 `logger.xxx`。注意：`download_video` 内的实时进度条仍直接写 stdout（非日志）。CLI 加 `-v/--verbose` 让控制台也降到 DEBUG。
+  - **视觉约定（避免「丑/乱」）**：① 单视频**不显示** `[1/1]` 序号（仅合集多视频才显示 `[i/N]`，避免误导）；② `完成` 汇总行在 INFO 层不带 `[4/4]` 前缀（`[4/4]` 步骤标记只在 DEBUG 成组出现，默认控制台不会看到孤立的 `[4/4]`）；③ **视频之间、链接之间用空行分隔**——通过发送空消息触发 loguru 纯空行（logger.py 的 `_console_format`/`_file_format` 对空消息返回 `"\n"`），不要用带 `INFO |` 前缀的空行。
 
 ## 关键坑点（改动前必读）
 
