@@ -175,6 +175,8 @@ class Config:
 
 _MIX_PATH_PATTERN = re.compile(r"/(?:share/mix/detail|collection)/(\d+)")
 _AWEME_ID_PATTERN = re.compile(r"/video/(\d+)")
+# 图文笔记页：https://www.douyin.com/note/<aweme_id>（PC Web 端 / 分享跳转后形态）
+_NOTE_ID_PATTERN = re.compile(r"/note/(\d+)")
 # PC Web 端详情页：https://www.douyin.com/jingxuan?modal_id=<aweme_id>
 _AWEME_ID_QS_PATTERN = re.compile(r"[?&]modal_id=(\d+)")
 # PC Web 端合集页：/collection?collection_id=<id> 或 ?mix_id=<id>
@@ -185,13 +187,16 @@ def _try_resolve(url: str) -> Optional[Tuple[str, str]]:
     """从 URL 文本中解析 (资源类型, 资源ID)，未命中返回 None。
 
     覆盖两类形态：
-      - 路径形态：/video/<id>、/collection/<id>、/share/mix/detail/<id>
+      - 路径形态：/video/<id>、/note/<id>、/collection/<id>、/share/mix/detail/<id>
       - PC Web 端查询参数形态：?modal_id=<aweme_id>、?collection_id=<id>、?mix_id=<id>
     """
     m = _MIX_PATH_PATTERN.search(url)
     if m:
         return "mix", m.group(1)
     m = _AWEME_ID_PATTERN.search(url)
+    if m:
+        return "one", m.group(1)
+    m = _NOTE_ID_PATTERN.search(url)
     if m:
         return "one", m.group(1)
     m = _MIX_ID_QS_PATTERN.search(url)
@@ -215,6 +220,7 @@ async def resolve_share_url(share_url: str, config: Config) -> Tuple[str, str]:
       - 合集页 https://www.iesdouyin.com/share/mix/detail/{id}/
       - 合集页 https://www.douyin.com/collection/{id}
       - 单视频 https://www.douyin.com/video/{id}
+      - 图文笔记 https://www.douyin.com/note/{id}
       - PC Web 端详情页 https://www.douyin.com/jingxuan?modal_id={aweme_id}
       - PC Web 端合集页 https://www.douyin.com/collection?collection_id={id}
     """
@@ -271,6 +277,52 @@ def _short_err(e: Exception, limit: int = 160) -> str:
     """截断异常信息，避免把超长的抖音 API URL 整段打印到终端。"""
     s = str(e)
     return s if len(s) <= limit else s[:limit] + "..."
+
+
+def _humanize_error(e: Exception) -> str:
+    """将底层异常转换为对用户友好的中文失败原因。
+
+    目标：避免让用户在日志里看到 'NoneType' object has no attribute 'get'
+    这类晦涩的 Python 内部错误。已知根因与对应文案：
+
+    - 视频被删除/设为私密/风控返回空数据 → aweme_detail 为 None，
+      已由 fetch_one_video 显式抛出可读错误（命中第一条规则，原样返回）。
+    - 其它未预期的 NoneType 错误 → 兜底提示，引导用户看 app.log。
+    - 网络/超时/403/429 等 → 给出重试建议。
+
+    返回翻译后的字符串；若无法归类则回退到原始错误信息。
+    """
+    msg = (str(e) or "").strip()
+    if not msg:
+        msg = type(e).__name__
+
+    # 已被业务代码显式抛出的、对人类可读的错误，原样返回
+    if any(k in msg for k in (
+        "视频可能已被作者删除",
+        "未获取到视频信息",
+        "无视频下载地址",
+        "无有效图片地址",
+        "无法从链接解析资源类型",
+    )):
+        return msg
+
+    # 之前会吞掉真因的晦涩写法：'NoneType' object has no attribute 'get'
+    if "NoneType" in msg and "get" in msg:
+        return ("接口返回内容为空（视频可能已被作者删除或设为私密，"
+                "或抖音风控导致数据缺失）；详见 app.log")
+
+    # 网络 / 超时类
+    if any(k in msg for k in ("ConnectError", "TimeoutError", "timed out",
+                              "连接", "Connection", "Timeout")):
+        return "网络请求失败（无法连接抖音服务器，请检查网络后重试）"
+
+    # HTTP 状态类
+    if "403" in msg:
+        return "请求被抖音拒绝（疑似风控），可稍后重试或更换网络"
+    if "429" in msg:
+        return "请求过于频繁（抖音限流），请降低速度后重试"
+
+    return msg
 
 
 async def _request_with_retry(
@@ -447,9 +499,36 @@ async def fetch_one_video(aweme_id: str, config: Config) -> Dict[str, Any]:
                 raise ValueError(f"未获取到视频信息，aweme_id={aweme_id}")
             # 从原始响应提取视频元数据
             aweme_detail = (
-                response.get("aweme_detail", {}) if isinstance(response, dict) else {}
+                response.get("aweme_detail") if isinstance(response, dict) else None
             )
+            if not aweme_detail:
+                # 视频被作者删除 / 设为私密 / 风控返回空数据时，抖音接口会返回
+                # {"aweme_detail": null}（键存在但值为 None，默认 {} 不会被启用）。
+                # 若直接用 .get 会抛 'NoneType' object has no attribute 'get'。
+                # 这里提前给出明确、可阅读的失败原因；且此 ValueError 不在
+                # _request_with_retry 的重试清单内，属于确定性失败，不会白重试。
+                raise ValueError(
+                    "视频可能已被作者删除或设为私密，接口未返回内容（aweme_detail 为空）"
+                )
             item["_meta"] = _extract_video_meta(aweme_detail)
+            # 图文笔记（aweme_type=68）处理：
+            # f2 的 PostDetailFilter 仅从 bit_rate[0].play_addr 取视频地址；
+            # 图文笔记的 bit_rate 为空，且其 video.play_addr 仅为音频（audio/mp4），
+            # 真实内容在 images 字段。故：有 bit_rate 走视频；否则若含图片，标记为
+            # 图文笔记并提取图片地址，同时清空 video_play_addr 避免误下音频。
+            raw_video = aweme_detail.get("video") or {}
+            if not raw_video.get("bit_rate"):
+                images = aweme_detail.get("images") or []
+                img_urls = [
+                    (im.get("url_list") or [None])[0]
+                    for im in images
+                    if isinstance(im, dict) and (im.get("url_list") or [None])[0]
+                ]
+                if img_urls:
+                    item["is_image_note"] = True
+                    item["images"] = img_urls
+                # 图文笔记无可用视频地址，置空避免误下音频
+                item["video_play_addr"] = None
             return item
         return _call()
 
@@ -658,6 +737,18 @@ def _print_progress(downloaded: int, total: int) -> None:
     bar = "=" * filled + "-" * (bar_len - filled)
     sys.stdout.write(f"\r  [{bar}] {pct:3d}% ")
     sys.stdout.flush()
+
+
+def _image_ext(url: str) -> str:
+    """根据图片 URL 推断文件扩展名（忽略查询串）。"""
+    u = (url or "").split("?")[0].lower()
+    if ".webp" in u:
+        return ".webp"
+    if ".png" in u:
+        return ".png"
+    if ".jpg" in u or ".jpeg" in u:
+        return ".jpg"
+    return ".jpg"
 
 
 # ── 元数据下载 ──────────────────────────────────────────────────
@@ -1072,6 +1163,98 @@ class DouyinDownloader:
                     )
         return False, last_error, attempt
 
+    async def _download_image_note(
+        self,
+        v: Dict[str, Any],
+        images: List[str],
+        aweme_id: str,
+        desc: str,
+        idx: str,
+        kind: str,
+        i: int,
+        date_str: str,
+        target_dir: Path,
+        progress_db: Optional["ProgressDB"],
+        share_url: str,
+    ) -> str:
+        """下载图文笔记的图片到子目录。
+
+        返回: 'ok'（下载成功）/ 'skipped'（已存在跳过）/ 'fail'（下载失败）。
+        """
+        cfg = self.config
+        name = _build_video_name(desc, str(aweme_id), cfg.filename_max_len)
+        if kind == "mix":
+            save_dir = target_dir / f"{i:03d}_{name}"
+        else:
+            save_dir = target_dir / f"{date_str}_{name}"
+
+        # 跳过判断：目录非空 或 进度库已记录成功
+        if not self.force:
+            if save_dir.exists() and any(save_dir.iterdir()):
+                logger.info(f"{idx}{save_dir.name}/ 图片已存在，跳过")
+                return "skipped"
+            if progress_db and progress_db.is_success_downloaded(str(aweme_id)):
+                logger.info(f"{idx}{save_dir.name}/ 进度记录已存在，跳过")
+                return "skipped"
+
+        logger.info(f"{idx}下载图文笔记图片 → {save_dir.name}/ （{len(images)} 张）")
+        ok, last_error = await self._download_image_set(images, save_dir, cfg)
+
+        meta = v.get("_meta") or {}
+        first_img = save_dir / f"01{_image_ext(images[0]) if images else '.jpg'}"
+        rec_kwargs = dict(
+            aweme_id=str(aweme_id),
+            resource_type=kind,
+            resource_id=aweme_id,
+            mix_name="",
+            desc=desc[:200],
+            file_path=str(first_img),
+            url=share_url,
+            meta={**meta, "image_count": len(images)},
+            retry_count=0,
+        )
+        if ok:
+            # 元数据（封面/文案/JSON；图文笔记原声多半为空，music 下载会被跳过）
+            if cfg.save_metadata:
+                base_path = save_dir / name
+                await download_metadata(v, base_path, cfg)
+            if progress_db:
+                progress_db.record(**rec_kwargs, status="success", error_msg=None)
+            return "ok"
+
+        logger.error(f"{idx}{save_dir.name}/ 图片下载失败: {last_error[:200]}")
+        if progress_db:
+            progress_db.record(**rec_kwargs, status="failed", error_msg=last_error[:500])
+        return "fail"
+
+    async def _download_image_set(
+        self,
+        images: List[str],
+        save_dir: Path,
+        config: Config,
+    ) -> Tuple[bool, str]:
+        """下载一组图片到 save_dir，已存在的跳过。返回 (是否全部成功, 最后错误)。"""
+        save_dir.mkdir(parents=True, exist_ok=True)
+        total = len([u for u in images if u])
+        if total == 0:
+            return False, "无有效图片地址"
+        ok = 0
+        last_error = ""
+        for n, url in enumerate(images, 1):
+            if not url:
+                continue
+            save_path = save_dir / f"{n:02d}{_image_ext(url)}"
+            if save_path.exists():
+                ok += 1
+                continue
+            try:
+                await _download_simple(url, save_path, config)
+                ok += 1
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"图片 {n}/{total} 下载失败: {e}")
+        return (ok == total), ("" if ok == total else last_error)
+
     async def retry_failed(self) -> Dict[str, Any]:
         """重试数据库中所有下载失败的记录（status='failed'）。
 
@@ -1296,11 +1479,37 @@ class DouyinDownloader:
                 # video_play_addr 可能是列表（多个清晰度地址）
                 if isinstance(play_addr, list):
                     play_addr = play_addr[0] if play_addr else None
+                images = v.get("images") or []
 
                 idx = f"[{i}/{len(videos)}] " if show_idx else ""
 
+                # 图文笔记：无视频地址但有图片，改下图片
+                if not play_addr and images:
+                    res = await self._download_image_note(
+                        v=v,
+                        images=images,
+                        aweme_id=aweme_id,
+                        desc=desc,
+                        idx=idx,
+                        kind=kind,
+                        i=i,
+                        date_str=date_str,
+                        target_dir=target_dir,
+                        progress_db=progress_db,
+                        share_url=share_url,
+                    )
+                    if res in ("ok", "skipped"):
+                        success += 1
+                    if res == "skipped":
+                        skipped += 1
+                    # 合集场景：图片笔记间也等待间隔（最后一个不等待）
+                    if download_interval and i < len(videos):
+                        actual_interval = _random_interval(download_interval)
+                        await asyncio.sleep(actual_interval)
+                    continue
+
                 if not play_addr:
-                    logger.info(f"{idx}{aweme_id} 无视频地址，跳过")
+                    logger.info(f"{idx}{aweme_id} 无视频地址且无图片，跳过")
                     continue
 
                 name = _build_video_name(desc, str(aweme_id), cfg.filename_max_len)
@@ -1589,11 +1798,12 @@ def main():
                 results.append(stat)
             except Exception as e:
                 # 单个链接失败不中断后续链接
-                logger.error(f"下载失败: {e}")
+                reason = _humanize_error(e)
+                logger.error(f"下载失败: {reason}")
                 results.append({
                     "url": url, "kind": "", "resource_id": "", "mix_name": "",
                     "total": 0, "success": 0, "skipped": 0, "target_dir": "",
-                    "error": str(e),
+                    "error": reason,
                 })
             # 多链接之间等待间隔，防止风控（复用 mix_download_interval，最后一个不等待）
             # 间隔时间在 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别
@@ -1614,10 +1824,13 @@ def main():
                 kind_label = "合集" if r.get("kind") == "mix" else (
                     "单视频" if r.get("kind") == "one" else "失败"
                 )
-                name = r.get("mix_name") or r.get("resource_id") or r.get("error", "")
-                status = f"成功 {r.get('success', 0)}/{r.get('total', 0)}，跳过 {r.get('skipped', 0)}"
                 if r.get("error"):
+                    # 失败：展示原始短链 + 失败原因
+                    name = r.get("url") or r.get("resource_id") or ""
                     status = f"失败: {r['error']}"
+                else:
+                    name = r.get("mix_name") or r.get("resource_id") or ""
+                    status = f"成功 {r.get('success', 0)}/{r.get('total', 0)}，跳过 {r.get('skipped', 0)}"
                 logger.info(f"  [{i}/{total}] {kind_label} {name} - {status}")
             if failed_links:
                 logger.info(f"  合计: 成功 {sum_success}/{sum_total}，跳过 {sum_skipped}，失败 {len(failed_links)} 个链接")
