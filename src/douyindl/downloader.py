@@ -131,7 +131,8 @@ class Config:
         self.max_connections = int(data.get("max_connections", 5))
 
         self.page_counts = int(data.get("page_counts", 20))
-        self.api_request_interval = float(data.get("api_request_interval", 2.0))
+        # API 层请求间隔（秒）：同时作为风控重试退避的 base。调大可降低首打 403 概率
+        self.api_request_interval = float(data.get("api_request_interval", 5.0))
         # API 层重试次数（针对抖音间歇性风控 403/429/5xx 的兜底；f2 自身不重试这类错误）
         self.api_max_retries = int(data.get("api_max_retries", 3))
 
@@ -251,11 +252,55 @@ async def resolve_share_url(share_url: str, config: Config) -> Tuple[str, str]:
 
 # ── Token 获取 ──────────────────────────────────────────────────
 
-def build_cookie() -> str:
-    """生成匿名 cookie（ttwid + 伪 msToken），无需登录。"""
-    ttwid = TokenManager.gen_ttwid()
+# ── 会话预热（降低「裸 ttwid」首打 403 概率） ─────────────────────
+# 预热得到的首页 cookie（如 __ac_nonce）缓存一次，后续所有 API 请求复用；
+# 注意：sid_tt/odin_tt 等需浏览器 JS 才下发，纯 HTTP 拿不到，故预热仅补充
+# 首页下发的少量 cookie + 真实 ttwid，使请求比纯裸 ttwid 更像「连续会话」。
+_WARMED_COOKIES: Optional[str] = None
+
+
+def _warm_up_session(config: "Config") -> str:
+    """预热匿名会话：先 GET 抖音首页，取回首页下发的 cookie（如 __ac_nonce），
+    与后续真实 ttwid 合并，降低首打 403 概率。结果缓存，仅执行一次；
+    失败（网络/超时）则返回空串，退化到仅 ttwid。"""
+    global _WARMED_COOKIES
+    if _WARMED_COOKIES is not None:
+        return _WARMED_COOKIES
+    extra = ""
+    try:
+        headers = dict(config.default_headers)
+        with httpx.Client(
+            headers=headers,
+            proxies=None,
+            timeout=config.timeout,
+            follow_redirects=True,
+        ) as client:
+            resp = client.get("https://www.douyin.com/")
+        extra = "; ".join(f"{k}={v}" for k, v in resp.cookies.items())
+        if extra:
+            logger.debug(f"会话预热：获得首页 cookie {len(resp.cookies)} 项")
+    except Exception as e:
+        logger.warning(f"会话预热(首页)失败，跳过：{_short_err(e)}")
+    _WARMED_COOKIES = extra
+    return _WARMED_COOKIES
+
+
+def build_cookie(config: Optional["Config"] = None) -> str:
+    """生成匿名 cookie：优先复用预热得到的首页 cookie（__ac_nonce 等），
+    再补一个真实 ttwid（每次新鲜，保留重试「换新会话」机制）与假 msToken。
+    config 为 None 时（极少路径）回退到裸 ttwid + 假 msToken。"""
     ms_token = TokenManager.gen_false_msToken()
-    return f"ttwid={ttwid}; msToken={ms_token}"
+    if config is None:
+        ttwid = TokenManager.gen_ttwid()
+        return f"ttwid={ttwid}; msToken={ms_token}"
+    warmed = _warm_up_session(config)
+    ttwid = TokenManager.gen_ttwid()
+    parts = []
+    if warmed:
+        parts.append(warmed)
+    parts.append(f"ttwid={ttwid}")
+    parts.append(f"msToken={ms_token}")
+    return "; ".join(parts)
 
 
 def build_crawler_kwargs(cookie: str, config: Config) -> Dict[str, Any]:
@@ -277,6 +322,23 @@ def _short_err(e: Exception, limit: int = 160) -> str:
     """截断异常信息，避免把超长的抖音 API URL 整段打印到终端。"""
     s = str(e)
     return s if len(s) <= limit else s[:limit] + "..."
+
+
+# 失败链接记录文件：最终下载失败的链接以「当前时间 原因 url」追加写入，
+# 便于以后手工重试本文件（与 urls 同目录）
+FAILED_URLS_FILE = Path("urls_fail")
+
+
+def write_failed_url(url: str, reason: str) -> None:
+    """将最终失败的链接追加写入 urls_fail。格式：当前时间 原因 url。"""
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{now} {reason} {url}\n"
+        with open(FAILED_URLS_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+        logger.debug(f"失败链接已记录到 {FAILED_URLS_FILE}: {line.strip()}")
+    except Exception as e:
+        logger.warning(f"写入失败链接记录 {FAILED_URLS_FILE} 失败: {e}")
 
 
 def _humanize_error(e: Exception) -> str:
@@ -355,7 +417,7 @@ async def _request_with_retry(
     max_attempts = max(1, config.api_max_retries)
     for attempt in range(max_attempts):
         try:
-            cookie = build_cookie()
+            cookie = build_cookie(config)
             kwargs = build_crawler_kwargs(cookie, config)
             return await fetch_factory(kwargs)
         except (
@@ -1716,6 +1778,10 @@ def main():
         log_file=config.log_file,
     )
 
+    # 会话预热：先访问抖音首页拿到首页 cookie，降低后续 API 首打 403 概率
+    # （仅执行一次，结果缓存；失败不影响主流程，回退裸 ttwid）
+    _warm_up_session(config)
+
     # CLI -m 参数精细控制元数据子开关
     # - 未指定 -m：沿用 config.yaml 设置
     # - -m 或 -m all：开启全部元数据
@@ -1800,6 +1866,8 @@ def main():
                 # 单个链接失败不中断后续链接
                 reason = _humanize_error(e)
                 logger.error(f"下载失败: {reason}")
+                # 记录到 urls_fail（时间 原因 url），便于以后手工重试本文件
+                write_failed_url(url, reason)
                 results.append({
                     "url": url, "kind": "", "resource_id": "", "mix_name": "",
                     "total": 0, "success": 0, "skipped": 0, "target_dir": "",

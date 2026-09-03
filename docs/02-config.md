@@ -33,10 +33,10 @@ uv run python -m douyindl "<链接>" -c /path/to/custom-config.yaml
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `page_counts` | int | 10 | 合集 API 分页每页条数，不建议超过 20，可能触发风控 |
-| `api_request_interval` | float | 2.0 | API 分页请求间隔（秒），避免抖音风控 |
+| `api_request_interval` | float | 5.0 | API 分页请求间隔（秒），避免抖音风控；**同时作为风控重试退避的基准**（实际退避 ≈ 此值 ±10%）。调大可降低「裸会话首打 403」概率，代价是请求更稀疏、整体更慢 |
 | `api_max_retries` | int | 3 | **业务层 API 重试次数**：针对抖音对 `aweme/detail`/合集列表的间歇性风控（偶发 403/429/5xx）。f2 自身不重试这类错误，这里在业务层补一层带随机抖动退避的重试，每次重试都重新生成匿名 ttwid 会话（等价于「换 PC 链接重跑」能成功）。0 表示不重试 |
 
-> 抖音会在批量下载时对单视频/合集接口偶发返回 403 Forbidden，这是风控而非接口故障。设置 `api_max_retries ≥ 1` 后，失败的请求会自动换新会话重试，通常随即成功。若仍失败，可运行 `-r/--retry-failed` 在进度库中重跑失败记录（同样会换新会话重试）。`api_request_interval` 同时作为重试退避的基准（取与 2.0 的较大值再随机抖动）。
+> 抖音会在批量下载时对单视频/合集接口偶发返回 403 Forbidden，这是风控而非接口故障（根因见 CLAUDE.md「403 风控根因与应对」节）。设置 `api_max_retries ≥ 1` 后，失败的请求会自动换新会话重试，通常随即成功。**会话预热**：启动时会先 GET 抖音首页并把首页 cookie（`__ac_nonce` 等）并入后续所有 API 请求，使请求比纯裸 ttwid 更像连续会话，进一步降低首打 403 概率（局限：`sid_tt`/`odin_tt` 需浏览器 JS 才下发，纯 HTTP 拿不到）。若仍失败，可运行 `-r/--retry-failed` 在进度库中重跑失败记录（同样会换新会话重试）；重试 3 次仍失败的链接会自动写入 `urls_fail`（`时间 原因 url` 格式），供手工重试。`api_request_interval` 同时作为重试退避的基准（实际退避 ≈ 此值 ±10%）。
 
 合集视频数超过 `page_counts` 时会自动翻页，每页之间等待 `api_request_interval` 秒。
 
@@ -121,7 +121,8 @@ max_connections: 5
 
 # 抖音 API 调用相关
 page_counts: 10
-api_request_interval: 2.0
+# API 分页间隔（秒）；同时作为风控重试退避基准。调大可降低首打 403 概率
+api_request_interval: 5.0
 api_max_retries: 3
 
 # 视频下载相关

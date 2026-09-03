@@ -16,6 +16,7 @@ logs/
 *.db
 .douyindl/
 app.log
+urls_fail
 
 # ── 编辑器 / IDE ────────────────────────────────
 .vscode/

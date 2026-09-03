@@ -75,9 +75,9 @@ douyinDL/
 
 - **`Config`**：从 `config.yaml` 加载，逐项带默认值兜底；`DEFAULT_CONFIG_PATH` 由 `__file__` 向上三级定位到项目根 `config/config.yaml`。
 - **`resolve_share_url`**：支持短链 `v.douyin.com`、合集 `iesdouyin.com/share/mix/detail/{id}` 或 `douyin.com/collection/{id}`、单视频 `douyin.com/video/{id}`；短链跟随重定向后用正则 `_MIX_PATH_PATTERN` / `_AWEME_ID_PATTERN` 提取 `mix`/`one` 类型与 ID。
-- **匿名认证**：`build_cookie()` 用 `TokenManager.gen_ttwid()` + `gen_false_msToken()` 拼 cookie，无需登录。
+- **匿名认证**：`build_cookie(config)` 优先复用「会话预热」拿到的首页 cookie（`__ac_nonce` 等），再补真实 `ttwid`（`gen_ttwid()`，每次新鲜）+ 假 `msToken`（`gen_false_msToken()`）；无需登录。根因见「403 风控根因与应对」节。
 - **视频列表**：`fetch_mix_videos`（分页循环，受 `page_counts`/`api_request_interval` 节流）与 `fetch_one_video`，分别用 f2 的 `UserMixFilter._to_list()` 与 `PostDetailFilter._to_dict()`。
-- **API 请求重试层**：`fetch_one_video` 与 `fetch_mix_videos` 的接口调用统一经 `_request_with_retry` 包裹。原因：f2 的 `base_crawler.handle_http_status_error` 对 403/429/5xx 等 HTTP 状态错误是 `else` 分支**直接抛异常、不进入重试循环**（它只在响应为空时才重试）。抖音对 `aweme/detail` 等接口存在**间歇性风控（偶发 403 Forbidden）**，表现为批量下载时零星失败——而换新会话（换 PC 链接/重跑）往往就成功。本层补上重试：**每次重试都重新生成匿名 ttwid cookie（换会话）**，退避用 `_random_interval(max(api_request_interval, 2.0))`，仅对 `APIResponseError`/`APIRateLimitError`/`APIConnectionError`/`APITimeoutError` 重试，逻辑错误不重试。重试次数由 `config.api_max_retries`（默认 3）控制。
+- **API 请求重试层**：`fetch_one_video` 与 `fetch_mix_videos` 的接口调用统一经 `_request_with_retry` 包裹。原因：f2 的 `base_crawler.handle_http_status_error` 对 403/429/5xx 等 HTTP 状态错误是 `else` 分支**直接抛异常、不进入重试循环**（它只在响应为空时才重试）。抖音对 `aweme/detail` 等接口存在**间歇性风控（偶发 403 Forbidden）**，表现为批量下载时零星失败——而换新会话（换 PC 链接/重跑）往往就成功。本层补上重试：**每次重试都重新生成匿名 ttwid cookie（换会话）**，退避用 `_random_interval(max(api_request_interval, 2.0))`，仅对 `APIResponseError`/`APIRateLimitError`/`APIConnectionError`/`APITimeoutError` 重试，逻辑错误不重试。重试次数由 `config.api_max_retries`（默认 3）控制。另见「会话预热」：启动先 GET 抖音首页并入首页 cookie 进一步降低首打 403；`config.api_request_interval` 调大（默认 5.0s）亦可降首打概率（详见「403 风控根因与应对」节）。
 - **`_extract_video_meta`**：f2 filter 会丢失 `video.*` 嵌套字段，此函数从原始 JSON 补提（duration/width/height/file_size/bit_rate/fps/ratio/video_format/is_h265/作者/统计/创建时间），用于入库。
 - **下载**：`download_video` 用 httpx 流式下载，**注意其内部 `AsyncClient(timeout=60)` 是硬编码，并不读取 `config.timeout`**；限速由 `max_download_speed`（字节/秒，0=不限）按累计字节数节流。`_download_simple` 用于小文件（封面/原声）。
 - **`ProgressDB`**：SQLite 表 `downloaded_videos`，主键 `aweme_id`；`_migrate_schema` 用 `PRAGMA table_info` 检测缺失列并 `ALTER TABLE ADD COLUMN` 做版本迁移（兼容 v0.3→v0.5 旧库）。`status` 字段记录 `success`/`failed`，失败不跳过、可重跑。
@@ -86,6 +86,24 @@ douyinDL/
 - **日志（loguru，双写）**：`src/douyindl/logger.py` 的 `setup_logger()` 配置两个 sink——**控制台（stderr）级别由 `config.log_level` 控制（默认 INFO）** + **文件 `app.log` 固定 DEBUG**。代码内已按级别区分：`DEBUG`=`[1/4]~[4/4]` 步骤脚手架/列表枚举/等待间隔（含 `[4/4] 完成` 步骤标记）、`保存目录` 路径、合集累计下载数等细节；`INFO`=单条结果（解析到的资源类型/ID、每条下载成功+元数据、跳过原因、完成汇总 `完成: 成功 X/N，跳过 Y`、多链接总结）；`WARNING`=偶发风控/下载的可恢复重试提示；`ERROR`=真实失败（重试耗尽/异常/参数错误）。原 `print()` 已全部替换为 `logger.xxx`。注意：`download_video` 内的实时进度条仍直接写 stdout（非日志）。CLI 加 `-v/--verbose` 让控制台也降到 DEBUG。
   - **视觉约定（避免「丑/乱」）**：① 单视频**不显示** `[1/1]` 序号（仅合集多视频才显示 `[i/N]`，避免误导）；② `完成` 汇总行在 INFO 层不带 `[4/4]` 前缀（`[4/4]` 步骤标记只在 DEBUG 成组出现，默认控制台不会看到孤立的 `[4/4]`）；③ **视频之间、链接之间用空行分隔**——通过发送空消息触发 loguru 纯空行（logger.py 的 `_console_format`/`_file_format` 对空消息返回 `"\n"`），不要用带 `INFO |` 前缀的空行。
 
+## 403 风控根因与应对（重要）
+
+批量下载时常见「第一次请求 403 Forbidden → 重试（换新 ttwid）→ 成功」的现象。根因与应对如下：
+
+**请求身份是「合成匿名」的**：`build_cookie()` 的 `msToken` 永远是**假的**随机串（`gen_false_msToken()`）；`ttwid` 是抖音下发的真实值，但属于**「裸」会话**——只有 ttwid 一个 cookie，没有真实浏览器先逛一遍 douyin.com 会累积的 `sid_tt`/`odin_tt`/`passport_csrf_token` 等「已被访问」cookie。抖音 `aweme/detail` 接口会对这种冷启动匿名会话做**概率性挑战**，命中即 403。
+
+**为什么「第一次 403、重试就成功」**：重试时 `_request_with_retry` 重新 `build_cookie()`——生成**全新 ttwid（= 新会话）+ ~2 秒带抖动退避**，相当于「换 PC 链接重跑」= 重新掷一次骰子，大概率放行。若真是 IP 硬封禁，重试也会失败；重试几乎总能成功，恰恰证明它是**按次概率放行**而非硬封。
+
+**为什么「感觉现在 80% 都 403」**：大概率是**可见性变化、不是频率变高**——加重试前 f2 遇 403 直接失败（你看到「下载失败」或手动重跑），现在重试会显式打印 WARNING，于是本就存在的 403 第一次被看见。除非对比历史成功率确证下降，否则先按「可见性变了」理解；若确变高，通常是抖音收紧匿名接口风控、或本机因下载量大 IP 风险分升高。
+
+**有影响吗**：没有任何影响。每条视频只多付一次 ~2 秒退避，结果完整正确，不缺文件、不损坏；403 日志是预期噪声（控制台已屏蔽 f2 的 403 大段 URL 噪声，仅 `app.log` 留存）。
+
+**缓解措施（均已实施，可按需调参）**：
+- `config.api_request_interval` 调大（默认 5.0s）：同时作为风控重试退避 base，请求更稀疏、首打 403 概率更低，代价是整体更慢。
+- **会话预热**：启动（CLI `main()`）时先 GET 抖音首页，把首页下发的 cookie（`__ac_nonce` 等）并入后续所有 API 请求（`_warm_up_session()`，结果缓存一次）。作用：让请求比纯裸 ttwid 更像「连续会话」。
+  - 局限：`sid_tt`/`odin_tt` 等需浏览器 JS 才下发，纯 HTTP 拿不到，故预热只能补充首页少量 cookie + 真实 ttwid，无法完全模拟登录态浏览器；要进一步降 403 需引入无头浏览器（playwright）取完整 cookie 罐——当前未做。
+- 重试次数 `api_max_retries`（默认 3）兜底最终失败；仍失败则写入 `urls_fail`（`时间 原因 url`）供手工重试。
+
 ## 关键坑点（改动前必读）
 
 - **代理**：前文已强调，运行与代码两层都要禁用代理，否则请求异常。
@@ -93,7 +111,7 @@ douyinDL/
 - **`timeout` 不一致**：`config.timeout`（默认 15s）用于 API/链接解析；视频下载用硬编码 60s。调超时注意区分。
 - **`max_tasks=1`**：`config.yaml` 默认单任务，控制并发不要盲目调高以免触发风控。
 - **`video_play_addr` 可能为空或列表**：代码已处理（取列表首项），新增下载逻辑时注意判空。
-- **`aweme/detail` 偶发 403 是风控、不是 bug**：抖音对单视频详情/合集列表接口有间歇性风控，批量下载时零星返回 `403 Forbidden`。f2 自身对该类 HTTP 状态错误**不重试**（直接抛 `APIResponseError`），所以此前会直接失败。`fetch_one_video`/`fetch_mix_videos` 已用 `_request_with_retry` 补上带抖动退避的重试（每次换新 ttwid 会话），重现「换 PC 链接重跑就成功」的效果。若仍失败，可用 `--retry-failed` 在进度库里重跑失败记录（会再次换新会话重试）。调大 `config.api_max_retries` 可提高成功率，但过高会增加被风控识别的概率，慎用。
+- **`aweme/detail` 偶发 403 是风控、不是 bug**：根因与缓解见「403 风控根因与应对」节。实操要点：重试层已用 `_request_with_retry`（每次换新 ttwid 会话 + 抖动退避，`api_max_retries` 默认 3 控制次数）；仍失败可用 `--retry-failed` 重跑进度库失败记录（再次换新会话），或调大 `api_max_retries`/`api_request_interval`。注意 `api_max_retries` 过高会增加被风控识别概率，慎用。
 - **`_meta` 来自原始响应**：f2 filter 不提供完整元数据，任何依赖分辨率/码率/时长的地方都要走 `_extract_video_meta`。
 - **进度库相对路径**：`ProgressDB` 路径相对当前工作目录解析（CLI 运行时 cwd=项目根）。非 CLI 调用时注意 cwd。
 - **`downloads/` 与 `.douyindl/`** 是运行产物，已下载视频/进度库不要误删；`downloads/` 下 72 个 mp4 为既有成果。

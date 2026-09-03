@@ -8,7 +8,7 @@
 user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
 
 # HTTP 请求超时（秒）
-timeout: 15
+timeout: 20
 
 # API 请求最大重试次数
 max_retries: 5
@@ -25,8 +25,9 @@ max_connections: 5
 # 合集 API 分页每页条数（不建议超过 20，可能触发风控）
 page_counts: 10
 
-# API 分页请求间隔（秒），避免抖音风控
-api_request_interval: 2.0
+# API 分页请求间隔（秒），避免抖音风控；同时作为「风控重试」退避的 base（实际退避≈此值±10%）
+# 调大可降低「裸会话首打 403」概率（配合会话预热使用），代价是请求更稀疏、整体更慢
+api_request_interval: 5.0
 
 # API 层重试次数：针对抖音对 aweme/detail / 合集列表的间歇性风控（偶发 403/429/5xx）
 # 注意：f2 自身遇到这类 HTTP 状态错误会直接抛异常、不重试，因此这里在业务层补一层
@@ -38,7 +39,7 @@ api_max_retries: 3
 
 # 合集内视频下载间隔（秒），合集场景使用，单视频无需等待
 # 用户要求合集间隔 60 秒
-mix_download_interval: 30
+mix_download_interval: 60
 
 # 流式下载 chunk 大小（字节），默认 64KB
 chunk_size: 65536
@@ -54,7 +55,7 @@ download_retry_interval: 5.0
 
 # 最大下载速度（字节/秒），0 表示不限速
 # 示例：10MB/s = 10485760，5MB/s = 5242880，1MB/s = 1048576
-max_download_speed: 10485760
+max_download_speed: 1048576
 
 
 # ── 元数据保存 ────────────────────────────────────────────────
