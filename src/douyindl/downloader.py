@@ -73,6 +73,20 @@ from f2.exceptions import (
 # 统一日志出口（loguru）：控制台默认 INFO + 文件 app.log 固定 DEBUG
 from .logger import logger, setup_logger
 
+# 并发分段下载引擎（移植自即存 jicun-dl 的 NativeDownloader）
+from .download_engine import (
+    DEFAULT_FILE_CONCURRENCY,
+    DEFAULT_LANES,
+    DownloadError,
+    download_concurrent,
+)
+# 浏览器回退解析（抖音 Web 接口被 SecSDK 封死时的兜底方案）
+from .browser_fallback import (
+    BrowserNotFoundError,
+    BrowserResolveError,
+    resolve_via_browser,
+)
+
 # ── 配置加载 ────────────────────────────────────────────────────
 
 # 配置文件默认路径（项目根目录下 config/config.yaml）
@@ -178,6 +192,35 @@ class Config:
         self.preflight_check_deps = bool(data.get("preflight_check_deps", True))
         # 连通性探针（金丝雀）：批量下载前探测接口是否可用，整体被拦截则提前中止
         self.preflight_canary = bool(data.get("preflight_canary", True))
+
+        # ── 解析策略（v0.6.0）──
+        # 'auto'   : 先走 f2 接口，被系统性 403 拦截时自动降级到浏览器解析（推荐）
+        # 'f2'     : 只用 f2 接口（快，但服务端变更签名时会整体失败）
+        # 'browser': 只用浏览器解析（慢但稳，需本机 Chrome/Edge）
+        self.resolve_mode = str(data.get("resolve_mode", "auto")).lower()
+        # 浏览器解析单条等待播放器起播的最长秒数
+        self.browser_wait_seconds = float(data.get("browser_wait_seconds", 25.0))
+        # 浏览器 CDP 调试端口，0 表示自动选空闲端口
+        self.browser_port = int(data.get("browser_port", 0))
+
+        # ── 并发分段下载（v0.6.0，移植 jicun-dl）──
+        # 是否启用并发分段下载；关闭则退回单连接顺序流式下载
+        self.concurrent_download = bool(data.get("concurrent_download", True))
+        # 每文件并发连接数（对齐 jicun-dl DEFAULT_LANES）
+        self.dl_lanes = int(data.get("dl_lanes", DEFAULT_LANES))
+        # 同时下载几个文件（对齐 jicun-dl FILE_CONCURRENCY）
+        self.dl_file_concurrency = int(data.get(
+            "dl_file_concurrency", DEFAULT_FILE_CONCURRENCY))
+        # 主体分段大小（字节），默认 4MB
+        self.dl_segment_bytes = int(data.get("dl_segment_bytes", 4 * 1024 * 1024))
+        # 文件尾部切小段的范围与段大小（收尾阶段慢连接拖累按比例缩小）
+        self.dl_tail_bytes = int(data.get("dl_tail_bytes", 32 * 1024 * 1024))
+        self.dl_tail_chunk_bytes = int(data.get("dl_tail_chunk_bytes", 1024 * 1024))
+        # 小于此字节数不分段（单连接顺序下）
+        self.dl_segment_from_bytes = int(data.get(
+            "dl_segment_from_bytes", 8 * 1024 * 1024))
+        # 慢连接轮换阈值（秒）：一条连接在此时间内没收完当前段就掐掉换连接
+        self.dl_connection_budget = float(data.get("dl_connection_budget", 10.0))
 
     @property
     def default_headers(self) -> Dict[str, str]:
@@ -622,6 +665,136 @@ async def fetch_one_video(aweme_id: str, config: Config) -> Dict[str, Any]:
     return await _request_with_retry(_factory, config, label="获取视频详情")
 
 
+# ── 浏览器回退解析（v0.6.0）─────────────────────────────────────
+# 抖音 Web 接口 aweme/detail 现需 uifid + x-secsdk-web-signature（字节 BDMS
+# 原生 SDK 产物），纯 HTTP 无法复现 —— 详见 browser_fallback.py 模块文档。
+# 这里把浏览器解析结果转成与 f2 filter 等价的字典，让下游下载/入库逻辑
+# 完全无感（保持"解析层可替换"的设计）。
+
+def _from_browser_resolved(r) -> Dict[str, Any]:
+    """BrowserResolved → f2 filter 风格的视频字典。
+
+    字段对齐 `PostDetailFilter._to_dict()` 的子集，保证下游
+    `_build_video_name` / `download_metadata` / `ProgressDB.record` 无需改动。
+    """
+    name = _build_video_name(r.desc, r.aweme_id, 60)
+    return {
+        "aweme_id": r.aweme_id,
+        "desc": r.desc,
+        "video_play_addr": r.play_url,
+        "music_status": 0,          # 浏览器解析拿不到原声地址，置 0 跳过
+        "music_play_url": None,
+        "cover": "",                 # 同上，封面留空
+        "is_image_note": False,
+        "images": [],
+        "_meta": {
+            # 浏览器路径拿不到 API 侧的完整元数据，只填可从页面得到的
+            "nickname": r.nickname or None,
+        },
+        "_resolved_by": "browser",
+    }
+
+
+async def fetch_one_video_browser(
+    aweme_id: str, config: Config
+) -> Dict[str, Any]:
+    """用浏览器解析单个视频，返回 f2 filter 风格的字典。"""
+    results = await resolve_via_browser(
+        "one",
+        aweme_id,
+        user_agent=config.user_agent,
+        port=config.browser_port,
+        wait_seconds=config.browser_wait_seconds,
+    )
+    if not results:
+        raise BrowserResolveError(f"浏览器解析未返回结果（aweme_id={aweme_id}）")
+    return _from_browser_resolved(results[0])
+
+
+async def fetch_mix_videos_browser(
+    mix_id: str, config: Config, max_counts: int = 0
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """用浏览器解析合集，返回 (合集名, 视频字典列表)。"""
+    results = await resolve_via_browser(
+        "mix",
+        mix_id,
+        user_agent=config.user_agent,
+        port=config.browser_port,
+        wait_seconds=config.browser_wait_seconds * 2,   # 合集页需滚动，给双倍时间
+        max_items=max_counts,
+    )
+    mix_name = next((r.mix_name for r in results if r.mix_name), "")
+    videos = [_from_browser_resolved(r) for r in results if r.aweme_id]
+    return mix_name, videos
+
+
+def _is_systemic_block(exc: Exception) -> bool:
+    """判断异常是否为「服务端系统性拦截」（而非偶发风控）。
+
+    抖音服务端更新签名校验后，所有请求都会 403，此时重试再多次也无意义，
+    应立刻降级到浏览器解析。反之偶发 403 仍按原逻辑重试。
+
+    识别依据：f2 把 403 包装成 APIResponseError，其 str 里含状态码或
+    ArgusSecurityPlugin 的特征串。
+    """
+    msg = str(exc)
+    markers = (
+        "403",
+        "Forbidden",
+        "ArgusSecurityPlugin",
+        "Signature Not Found",
+        "Uifid Not Found",
+    )
+    return any(m in msg for m in markers)
+
+
+async def fetch_one_video_resilient(
+    aweme_id: str, config: Config
+) -> Dict[str, Any]:
+    """按 config.resolve_mode 解析单个视频，自动降级。
+
+    - 'f2'：只用 f2 接口
+    - 'browser'：只用浏览器
+    - 'auto'（默认）：先试 f2，遇系统性拦截立即降级浏览器并记住结果，
+      后续同批视频直接走浏览器（避免每条都白等一次重试）
+    """
+    if config.resolve_mode == "browser":
+        return await fetch_one_video_browser(aweme_id, config)
+
+    try:
+        return await fetch_one_video(aweme_id, config)
+    except Exception as e:
+        if config.resolve_mode == "auto" and _is_systemic_block(e):
+            logger.warning(
+                f"f2 接口被系统性拦截（{_short_err(e, 80)}），"
+                f"自动降级到浏览器解析"
+            )
+            # 记下本次进程已降级，后续不再重复试 f2
+            config.resolve_mode = "browser"
+            return await fetch_one_video_browser(aweme_id, config)
+        raise
+
+
+async def fetch_mix_videos_resilient(
+    mix_id: str, config: Config, max_counts: int = 0
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """按 config.resolve_mode 解析合集，自动降级（逻辑同上）。"""
+    if config.resolve_mode == "browser":
+        return await fetch_mix_videos_browser(mix_id, config, max_counts)
+
+    try:
+        return await fetch_mix_videos(mix_id, config=config, max_counts=max_counts)
+    except Exception as e:
+        if config.resolve_mode == "auto" and _is_systemic_block(e):
+            logger.warning(
+                f"f2 合集接口被系统性拦截（{_short_err(e, 80)}），"
+                f"自动降级到浏览器解析"
+            )
+            config.resolve_mode = "browser"
+            return await fetch_mix_videos_browser(mix_id, config, max_counts)
+        raise
+
+
 def _extract_video_meta(aweme: Dict[str, Any]) -> Dict[str, Any]:
     """从 API 原始响应的单个 aweme 节点提取视频元数据。
 
@@ -757,11 +930,21 @@ async def download_video(
 ) -> int:
     """流式下载视频文件。
 
+    v0.6.0 起默认走**并发分段下载引擎**（`download_engine.download_concurrent`，
+    移植自即存 jicun-dl 的 NativeDownloader）：探针 → 分段 → 共享游标多路
+    并发 → seek 直接写偏移 → 断点续传 → 慢连接轮换 → 多道完整性校验。
+
+    实测收益（抖音 CDN 对单连接限速）：
+      - 单连接顺序下载：受单路限速制约，速度低
+      - 多路并发：聚合速度随连接数近似线性提升；断连只从断点续传，不整段重来
+
+    通过 config.concurrent_download=False 可退回旧的单连接顺序流式实现。
+
     Args:
         video_url: 无水印视频下载地址
         save_path: 保存路径（含文件名）
-        config: 配置对象（使用 chunk_size / timeout / user_agent / max_download_speed）
-        headers: 额外请求头
+        config: 配置对象
+        headers: 额外请求头（并发模式下由引擎统一构造，此处仅用于单连接模式）
 
     Returns:
         下载的字节数
@@ -774,6 +957,50 @@ async def download_video(
         video_url = "https:" + video_url
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── 并发分段模式（默认）──
+    if getattr(config, "concurrent_download", True):
+        req_headers = config.default_headers | (headers or {})
+        max_speed = config.max_download_speed
+        speed_start = time.monotonic() if max_speed > 0 else 0.0
+
+        def _progress(downloaded: int, total: int) -> None:
+            _print_progress(downloaded, total)
+            # 限速：与单连接模式同一套算法——按累计字节算"期望用时"，
+            # 实际用时小于期望就 sleep 差值。这里不能用 await（回调是同步的），
+            # 故用 time.sleep；并封顶 1s 避免进度回调被长时间阻塞。
+            if max_speed > 0:
+                expected = downloaded / max_speed
+                actual = time.monotonic() - speed_start
+                if actual < expected:
+                    time.sleep(min(expected - actual, 1.0))
+
+        stats = await download_concurrent(
+            video_url,
+            save_path,
+            lanes=config.dl_lanes,
+            segment_bytes=config.dl_segment_bytes,
+            tail_bytes=config.dl_tail_bytes,
+            tail_chunk_bytes=config.dl_tail_chunk_bytes,
+            segment_from_bytes=config.dl_segment_from_bytes,
+            connection_budget=config.dl_connection_budget,
+            user_agent=config.user_agent,
+            referer=req_headers.get("Referer", "https://www.douyin.com/"),
+            progress_cb=_progress,
+            chunk_size=config.chunk_size,
+        )
+        if stats.size:
+            print()
+        logger.debug(
+            f"并发下载完成: {save_path.name} "
+            f"{stats.downloaded}/{stats.size}字节 "
+            f"chunks={stats.chunks} lanes={stats.lanes} "
+            f"重试={stats.retries} 轮换={stats.rotations} "
+            f"耗时={stats.elapsed:.2f}s"
+        )
+        return stats.downloaded
+
+    # ── 单连接顺序流式模式（concurrent_download=False 时的旧实现）──
     req_headers = config.default_headers | (headers or {})
 
     # 限速配置：max_download_speed 字节/秒，0 表示不限速
@@ -1518,7 +1745,7 @@ class DouyinDownloader:
         mix_name = ""
         if kind == "mix":
             logger.info(f"检测到合集链接, mix_id={resource_id}")
-            mix_name, videos = await fetch_mix_videos(
+            mix_name, videos = await fetch_mix_videos_resilient(
                 resource_id,
                 config=cfg,
                 max_counts=self.max_counts,
@@ -1532,7 +1759,7 @@ class DouyinDownloader:
             download_interval = cfg.mix_download_interval
         else:
             logger.info(f"检测到单视频链接, aweme_id={resource_id}")
-            videos = [await fetch_one_video(resource_id, cfg)]
+            videos = [await fetch_one_video_resilient(resource_id, cfg)]
             # 单视频直接下载到 output_dir
             target_dir = self.output_dir
             download_interval = 0
@@ -1848,7 +2075,9 @@ def _report_method_blocked() -> None:
     logger.error(
         "可选对策：① 等待 f2 发布适配新签名的新版（工具已自动检测，有更新会自升级并重启）；"
         "② 在 config.yaml 填入真实登录态 Cookie（login_cookie）绕过匿名风控；"
-        "③ 更换网络 IP / 稍后重试。"
+        "③ 改用浏览器解析（config.yaml 设 resolve_mode: browser），"
+        "由本机 Chrome 打开视频页取直链，不依赖 f2 签名；"
+        "④ 更换网络 IP / 稍后重试。"
     )
 
 
@@ -1932,15 +2161,27 @@ def main():
     # ── 前置检查 2：连通性探针（金丝雀）──
     # 若抖音服务端整体拦截匿名接口（全部 403），提前中止并给出可操作建议，
     # 避免对每个链接反复重试 3 次、把整批误写进 urls_fail。
-    if config.preflight_canary:
+    #
+    # 但 resolve_mode=browser 时不走 f2 接口（浏览器路径不依赖签名），
+    # 此时金丝雀失败属预期，不应阻断流程。
+    if config.preflight_canary and config.resolve_mode != "browser":
         try:
             healthy = asyncio.run(_canary_probe(config))
         except Exception as e:
             logger.warning(f"前置探针异常，跳过（{_short_err(e)}）")
             healthy = True
         if not healthy:
-            _report_method_blocked()
-            sys.exit(2)
+            if config.resolve_mode == "auto":
+                # auto 模式：f2 不可用但浏览器路径可用，降级继续而非中止
+                logger.warning(
+                    "f2 接口探针未通过（疑似系统性 403），将自动降级到浏览器解析。"
+                    "如需强制使用 f2，请在 config.yaml 设 resolve_mode: f2。"
+                )
+                logger.info("")
+                config.resolve_mode = "browser"
+            else:
+                _report_method_blocked()
+                sys.exit(2)
 
     # 会话预热：先访问抖音首页拿到首页 cookie，降低后续 API 首打 403 概率
     # （仅执行一次，结果缓存；失败不影响主流程，回退裸 ttwid）

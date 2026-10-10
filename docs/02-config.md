@@ -165,13 +165,100 @@ log_level: "INFO"
 log_file: "app.log"
 
 # 认证与前置检查
-# 真实登录态 Cookie（可选）：绕过匿名风控 403 的核心手段，需含 sid_tt/sess 等登录字段
+# 真实登录态 Cookie（可选）：主要缓解"偶发"风控 403。
+# 注意：它**无法**绕过签名校验（签名是服务端硬要求，与是否登录无关）
 login_cookie: ""
 # 依赖自检：启动时检查 f2 最新版，有更新则自动升级并重启
 preflight_check_deps: true
-# 连通性探针（金丝雀）：批量下载前探测接口是否可用，整体被拦截则提前中止
+# 连通性探针（金丝雀）：批量下载前探测接口是否可用
+# resolve_mode=auto 时探针失败会自动降级浏览器解析并继续，不再中止
 preflight_canary: true
+
+# 解析策略（v0.6.0）
+# 抖音 Web 接口 aweme/detail 现要求 uifid + x-secsdk-web-signature（字节 BDMS
+# 原生 SDK 产物），纯 HTTP 无法复现 → 默认 auto，自动降级到浏览器解析
+resolve_mode: "auto"          # auto | f2 | browser
+browser_wait_seconds: 25.0    # 等待播放器起播取直链的最长秒数
+browser_port: 0               # CDP 调试端口，0=自动选空闲端口
+
+# 并发分段下载（v0.6.0，移植自即存 jicun-dl 下载引擎）
+concurrent_download: true     # false=退回单连接顺序流式下载
+dl_lanes: 32                  # 每文件并发连接数（实际会被段数收敛）
+dl_file_concurrency: 4        # 同时下载几个文件
+dl_segment_bytes: 4194304     # 主体段 4MB
+dl_tail_bytes: 33554432       # 尾部 32MB 内切小段
+dl_tail_chunk_bytes: 1048576  # 尾段 1MB
+dl_segment_from_bytes: 8388608  # 小于 8MB 不分段
+dl_connection_budget: 10.0    # 慢连接轮换阈值（秒）
 ```
+
+---
+
+## 解析策略（`resolve_mode`）
+
+抖音 Web 接口 `aweme/v1/web/aweme/detail/` 目前需要两样纯 HTTP 拿不到的东西：
+
+| 要求 | 缺失时服务端返回 | 性质 |
+| --- | --- | --- |
+| `uifid` 查询参数 | `403 Blocked by ArgusSecurityPlugin Uifid Not Found` | 页面 JS 生成，可从浏览器取 |
+| `x-secsdk-web-signature` 签名 | `403 Blocked by ArgusSecurityPlugin Signature Not Found` | 字节 BDMS 原生算法，纯 HTTP 无法复现 |
+
+| 取值 | 行为 | 适用 |
+| --- | --- | --- |
+| `auto`（默认） | 先走 f2 接口；金丝雀探测或实际请求出现系统性 403 时，自动降级到浏览器解析，并记在 config 上（同批后续不再重复试 f2） | 绝大多数场景 |
+| `f2` | 只用 f2 接口，不降级 | f2 恢复可用、且想追求速度时 |
+| `browser` | 只用浏览器解析 | 不想等 f2 失败重试；或已确定 f2 不可用 |
+
+**为什么需要浏览器回退**：第三方 App（如「即存」）能免登录下载，不是因为解析算法更先进，而是**它是原生 App，走 App 端协议而非 Web 签名协议**。我们无法复现 SecSDK 签名，于是改为**借真实浏览器生成签名**：脚本拉起 headless Chrome，用 CDP（Chrome DevTools Protocol）打开视频页，等播放器把 `<video>` 填上直链后取走。
+
+**要求**：本机需安装 Chrome / Edge / Chromium（可用环境变量 `DOUYINDL_CHROME_PATH` 指定路径）。
+
+**代价与限制**：
+- 慢：单条约 5 秒（等播放器起播），远慢于纯 HTTP；合集逐条解析，N 条约 `5N` 秒。
+- 拿不到 API 侧元数据：封面、原声、分辨率、时长等均为空。故 `save_metadata` 开启时只会产出 `.txt`/`.json`，不会有 `.jpg`/`.mp3`。
+- 触发验证码时解析失败（会明确报错，不会静默产出坏文件）。
+
+---
+
+## 并发分段下载
+
+原实现是单连接顺序流式下载，遇到抖音 CDN 对单连接限速时速度低，且断连即整段重来。v0.6.0 起默认走移植自即存 `jicun-dl` 的并发分段引擎。
+
+### 工作原理
+
+```
+探针 GET Range: bytes=0-0        → 总长 / Content-Type / 是否认 Range
+   ├─ 回 200（忽略 Range）→ 退化为整条顺序下载
+   └─ 回 206 → 分段
+分段计划                          → 主体 4MB；尾部 32MB 内切 1MB；段数 ≤64
+共享游标 + N 路并发               → 谁空谁认领下一段（不是固定分片）
+每段 Range 请求                   → os.pwrite 写到对应偏移（不落 .part、不拼接）
+断连 / 慢连接                    → 从断点续传；10s 未收完则掐掉换连接
+完整性校验                        → 字节总数 + 落地文件大小 + Content-Range 偏移
+```
+
+### 参数说明
+
+| 参数 | 默认 | 作用 | 调大 / 调小的效果 |
+| --- | --- | --- | --- |
+| `concurrent_download` | `true` | 总开关 | `false` 退回单连接顺序流式（旧行为） |
+| `dl_lanes` | `32` | 每文件并发连接数 | **会被段数自然收敛**：4MB 文件只分 1 段，就只开 1 条连接。小文件看不到并发收益是正常的 |
+| `dl_file_concurrency` | `4` | 同时下载几个文件 | 批量下载时摊薄连接数，避免 4×32=128 条连接撞 CDN 并发上限 |
+| `dl_segment_bytes` | `4194304`（4MB） | 主体段大小 | 段越小请求越多、调度越细，但握手开销上升 |
+| `dl_tail_bytes` | `33554432`（32MB） | 尾部切小段的范围 | 收尾阶段慢连接的拖累范围 |
+| `dl_tail_chunk_bytes` | `1048576`（1MB） | 尾段大小 | 原版实测：尾部用 4MB 段时慢连接拖 8.5s，切到 1/4 后拖累按 1/4 计 |
+| `dl_segment_from_bytes` | `8388608`（8MB） | 小于此不分段 | 调小会让更多文件走分段（但小文件分段收益有限） |
+| `dl_connection_budget` | `10.0` | 慢连接轮换阈值（秒） | **按 4MB 段设计**；改 `dl_segment_bytes` 时建议同步调整，否则大段会被误判"慢"而反复轮换 |
+
+### 已实测验证
+
+| 场景 | 结果 |
+| --- | --- |
+| 分段计划（1MB / 6MB / 20MB / 200MB / 2GB / 7GB） | 覆盖完整、区间连续、段数 ≤64 全部通过 |
+| 64MB 文件，32/64 路并发 | SHA256 与源完全一致 |
+| **35% 概率随机断连**（48MB / 36 段 / 16 路） | 18 次重试后收敛，SHA256 一致 |
+| 4xx（404） | 立即失败不重试（403/404 再试也是白等） |
+| 单连接模式 vs 并发模式 | 产物逐字节一致 |
 
 ## 下一步
 

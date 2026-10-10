@@ -48,10 +48,10 @@ chunk_size: 65536
 filename_max_len: 60
 
 # 下载失败时的最大重试次数（不含首次下载），0 表示不重试
-download_max_retries: 3
+download_max_retries: 2
 
 # 下载重试间隔（秒），失败后等待多久再重试
-download_retry_interval: 5.0
+download_retry_interval: 3.0
 
 # 最大下载速度（字节/秒），0 表示不限速
 # 示例：10MB/s = 10485760，5MB/s = 5242880，1MB/s = 1048576
@@ -113,6 +113,55 @@ login_cookie: ""
 preflight_check_deps: true
 
 # 连通性探针（金丝雀）：正式批量下载前，用若干已知公开视频探测接口是否可用。
-# 若抖音服务端风控拦截（403）导致方法整体失效，提前告警并中止，避免对每个链接
-# 反复重试 3 次、把整批链接误写进 urls_fail。设为 false 可强制跳过（不推荐）。
+# 若抖音服务端风控拦截（403）导致方法整体失效，提前告警；resolve_mode=auto 时
+# 自动降级到浏览器解析并继续，设为 false 可强制跳过（不推荐）。
 preflight_canary: true
+
+
+# ── 解析策略（v0.6.0）─────────────────────────────────────────
+# 抖音 Web 接口 aweme/detail 现要求 uifid 参数 + x-secsdk-web-signature 签名
+# （字节 BDMS 安全 SDK 的原生算法产物，纯 HTTP 无法复现），表现为：
+#   403 Blocked by ArgusSecurityPlugin Uifid Not Found   （缺 uifid）
+#   403 Blocked by ArgusSecurityPlugin Signature Not Found（缺签名）
+# 三种取值：
+#   auto    : 先走 f2 接口，探测到系统性 403 时自动降级浏览器解析（默认，推荐）
+#   f2      : 只用 f2 接口（快，但服务端变更签名时整体失败）
+#   browser : 只用浏览器解析（慢但稳；需本机装 Chrome/Edge/Chromium）
+resolve_mode: "browser"
+
+# 浏览器解析时，等待播放器起播取直链的最长秒数（网络慢时可调大）
+browser_wait_seconds: 25.0
+
+# 浏览器 CDP 调试端口，0 = 自动选空闲端口；固定端口便于复用已开着的 Chrome
+browser_port: 0
+
+
+# ── 并发分段下载（v0.6.0，移植自即存 jicun-dl 下载引擎）────────
+# 原实现是单连接顺序流式下载，受抖音 CDN 单连接限速影响速度低，且断连即整段重来。
+# 开启后走：探针(bytes=0-0) → 分段 → 共享游标多路并发 → seek 直接写偏移
+#          → 断点续传 → 慢连接轮换 → 多道完整性校验
+concurrent_download: true
+
+# 每文件并发连接数（对齐 jicun-dl DEFAULT_LANES=32）。
+# 实际并发会被「分段数」自然收敛：4MB 的视频只分 1 段，就只开 1 条连接。
+dl_lanes: 32
+
+# 同时下载几个文件（对齐 jicun-dl FILE_CONCURRENCY=4）。
+# 批量下多个视频时摊薄连接数，避免开 4×32=128 条连接撞 CDN 并发上限。
+dl_file_concurrency: 4
+
+# 主体分段大小（字节，默认 4MB）：一次 Range 拉一段
+dl_segment_bytes: 4194304
+
+# 文件尾部 32MB 内切成 1MB 小段。
+# 实测收尾时慢连接拖住一个 4MB 段要 8.5s，切到 1/4 后拖累按 1/4 计。
+dl_tail_bytes: 33554432
+dl_tail_chunk_bytes: 1048576
+
+# 小于此字节数不分段，走单连接顺序下载（避免小文件开一堆连接反而更慢）
+dl_segment_from_bytes: 8388608
+
+# 慢连接轮换阈值（秒）：一条连接在该时间内没收完当前段就掐掉、从断点换连接。
+# 判据是「用多久没收完」而非速率——同批连接速率差 20 倍是常态，
+# 拿绝对速率当判据不是误杀就是没反应。改动 dl_segment_bytes 时建议同步调整。
+dl_connection_budget: 10.0

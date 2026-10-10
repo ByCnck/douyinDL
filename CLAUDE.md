@@ -64,12 +64,17 @@ douyinDL/
 ├── src/douyindl/
 │   ├── __init__.py                   # 导出 DouyinDownloader, main
 │   ├── __main__.py                   # python -m douyindl 入口
-│   └── downloader.py                 # 核心逻辑（约 1400 行，唯一大文件）
+│   ├── downloader.py                 # 核心逻辑（约 2000 行，唯一大文件）
+│   ├── browser_fallback.py           # v0.6.0 浏览器回退解析（CDP）
+│   ├── download_engine.py            # v0.6.0 并发分段下载引擎（jicun-dl 移植）
+│   └── logger.py                     # loguru 双 sink 配置
 ├── pyproject.toml                    # 依赖与脚本入口
 └── uv.lock
 ```
 
 `downloader.py` 是唯一核心模块，建议改动前通读：关键类/函数见 `docs/07-faq.md` 附录代码索引。
+
+> **v0.6.0 新增依赖说明**：`websockets`（CDP 通信）**未**写进 `pyproject.toml`——它是 f2 依赖链间接带入的。已在 f2 升级时验证可用。若将来 f2 换掉这条依赖链，需显式 `uv add websockets`，否则 `browser_fallback` 会 ImportError。
 
 ## 架构要点（downloader.py）
 
@@ -79,7 +84,7 @@ douyinDL/
 - **视频列表**：`fetch_mix_videos`（分页循环，受 `page_counts`/`api_request_interval` 节流）与 `fetch_one_video`，分别用 f2 的 `UserMixFilter._to_list()` 与 `PostDetailFilter._to_dict()`。
 - **API 请求重试层**：`fetch_one_video` 与 `fetch_mix_videos` 的接口调用统一经 `_request_with_retry` 包裹。原因：f2 的 `base_crawler.handle_http_status_error` 对 403/429/5xx 等 HTTP 状态错误是 `else` 分支**直接抛异常、不进入重试循环**（它只在响应为空时才重试）。抖音对 `aweme/detail` 等接口存在**间歇性风控（偶发 403 Forbidden）**，表现为批量下载时零星失败——而换新会话（换 PC 链接/重跑）往往就成功。本层补上重试：**每次重试都重新生成匿名 ttwid cookie（换会话）**，退避用 `_random_interval(max(api_request_interval, 2.0))`，仅对 `APIResponseError`/`APIRateLimitError`/`APIConnectionError`/`APITimeoutError` 重试，逻辑错误不重试。重试次数由 `config.api_max_retries`（默认 3）控制。另见「会话预热」：启动先 GET 抖音首页并入首页 cookie 进一步降低首打 403；`config.api_request_interval` 调大（默认 5.0s）亦可降首打概率（详见「403 风控根因与应对」节）。
 - **`_extract_video_meta`**：f2 filter 会丢失 `video.*` 嵌套字段，此函数从原始 JSON 补提（duration/width/height/file_size/bit_rate/fps/ratio/video_format/is_h265/作者/统计/创建时间），用于入库。
-- **下载**：`download_video` 用 httpx 流式下载，**注意其内部 `AsyncClient(timeout=60)` 是硬编码，并不读取 `config.timeout`**；限速由 `max_download_speed`（字节/秒，0=不限）按累计字节数节流。`_download_simple` 用于小文件（封面/原声）。
+- **下载**：`download_video` 默认走**并发分段下载**（`download_engine.download_concurrent`，移植 jicun-dl）；`config.concurrent_download=false` 时退回旧的单连接顺序流式实现。两条路径实测产物逐字节一致。限速由 `max_download_speed` 按累计字节节流（并发模式在进度回调里用 `time.sleep`，单连接模式在主循环里用 `asyncio.sleep`）。`_download_simple` 用于小文件（封面/原声）。
 - **`ProgressDB`**：SQLite 表 `downloaded_videos`，主键 `aweme_id`；`_migrate_schema` 用 `PRAGMA table_info` 检测缺失列并 `ALTER TABLE ADD COLUMN` 做版本迁移（兼容 v0.3→v0.5 旧库）。`status` 字段记录 `success`/`failed`，失败不跳过、可重跑。
 - **`DouyinDownloader`**：主流程 `run()`（解析→拉列表→下载→入库），`_download_with_retry`（受 `download_max_retries`）、`retry_failed()`（查失败记录→重新取地址→下载→更新库）。`main()` 为 CLI 入口，多链接串行、去重、下载后清空 `-i` 文件。
 - **风控**：合集视频间隔、多链接间隔、失败重试间隔均通过 `_random_interval(base)` 在 `[base*0.9, base]` 随机取值，避免固定间隔被识别。
@@ -108,25 +113,115 @@ douyinDL/
 
 上述是**间歇性、按次概率**的 403（重试换会话即可成功）。还存在另一种**系统性、必然**的 403：某天开始所有请求（含换新 ttwid 重试 3 次）**全部 403**，无论重试多少次都不成功。
 
-**根因（2026-10 实测确认）**：抖音**服务端更新了对匿名 `a_bogus` 签名的校验**，f2 0.0.1.7 内置的 a_bogus 算法（2024 年开源版，`f2/utils/abogus.py`，`@version 0.0.2`）已被服务端拒绝。证据链：
+**根因（2026-10 实测确认）**：抖音 Web 端 `aweme/v1/web/aweme/detail/` 现要求**两样东西**，纯 HTTP 都拿不到：
 
-1. **「依赖过期」假设不成立**：`uv pip install --dry-run "f2>0.0.1.7"` 结果 `Because only f2<=0.0.1.7 is available ... unsatisfiable` —— **f2 0.0.1.7 即 PyPI 最新版，无更新可升**。所以「第三方库有更新但本地没更新」不是原因。
-2. **非本机 IP 单封**：在**完全不同 IP/网络**的干净环境实测同一 `aweme/detail` 接口，同样返回 403（请求中带 f2 的 a_bogus 签名）。说明是**全局服务端校验变更**，不是用户本机 IP 被风控。
-3. **不是本地代码 bug**：本工具未改签名算法，只是调用 f2；f2 的算法与服务端不再匹配。
+1. **`uifid` 查询参数**——缺失时服务端返回 `403 Blocked by ArgusSecurityPlugin Uifid Not Found`。该值由页面 JS 生成。
+2. **`x-secsdk-web-signature` 签名**——字节 BDMS/Argus 安全 SDK 的**本地原生算法**产物（JS 混淆 + 浏览器指纹绑定）。补齐 uifid 后错误变为 `403 Blocked by ArgusSecurityPlugin Signature Not Found`。
 
-**结论**：匿名（免登录）下载器的「一劳永逸」在抖音持续改服务端的前提下**无法实现**——只要服务端轮换 a_bogus 校验且 f2 未跟进，匿名接口就会系统性失效。能做的是**快速暴露 + 给出可操作出路**，而非假装修好。
+证据链（全部为 2026-10-10 实测）：
 
-**应对（已落地为「前置检查」，每次下载前执行）**：
+1. **「依赖过期」假设不成立**：`uv pip install --dry-run "f2>0.0.1.7"` 结果 `Because only f2<=0.0.1.7 is available ... unsatisfiable` —— **f2 0.0.1.7 即 PyPI 最新版**。
+2. **非本机 IP 单封**：在完全不同 IP/网络的干净环境实测同一接口，同样 403。
+3. **补齐 uifid + fp + webid 仍不够**：错误从 `Uifid Not Found` 变为 `Signature Not Found`，证明签名是独立的第二道校验。
+4. **f2 的 a_bogus 已过期**：补齐 uifid/fp/webid 后用 f2 `ABogus.generate_abogus()` 签名，仍 `Signature Not Found`。服务端已换成 SecSDK 系校验。
+5. **SSR 分享页已无数据**：`www.douyin.com/video/{id}` 返回 JS 字节码挑战页（`_$jsvmprt`）；`www.iesdouyin.com/share/video/{id}/` 返回 `window._ROUTER_DATA` 但 `videoInfoRes` 为空——加完整浏览器 cookie 也一样（仍 302 跳回 www）。
+6. **旧接口全废**：`web/api/v2/aweme/iteminfo/` 返回 `status_code:11110 encrypt_data_miss`；`aweme.snssdk.com/aweme/v1/aweme/detail/`（App 端）返回 200 但**响应体为空**。
+7. **f2 内有未被使用的 `XBogus`**：`f2/utils/xbogus.py` 存在但无任何接口调用，实测也无法解锁上述端点。
 
-- **① 依赖自检 `_check_deps_fresh`**：启动时查 PyPI 的 f2 最新版；一旦 f2 发布适配新签名的新版，自动 `uv pip install` 升级并 `os.execv` 重启当前进程加载新版，**无需人工干预即跟进**。当前无新版时是 no-op，但把「下载前先更新依赖库」变成真实机制。
-- **② 连通性探针（金丝雀）`_canary_probe`**：批量下载**前**，用若干已知公开视频（`_CANARY_AWEME_IDS`）各探测一次 `aweme/detail`。只要任意一个「接口可达」（含视频已删/私密，均视为接口正常）即判定方法健康、放行；**仅当全部返回 403/风控**才判定「方法整体失效」，立即 `_report_method_blocked()` 打印清晰诊断并 `sys.exit(2)` 中止，**避免对每个链接反复重试 3 次、把整批误写进 `urls_fail`**。探针异常（网络问题）不贸然中止。
-- **③ 真实登录态 Cookie 绕过 `login_cookie`**：这是**当前唯一可靠的「一劳永逸」绕过手段**。在 `config.yaml` 填入浏览器登录后的完整 Cookie（含 `sid_tt`/`sess`/`odin_tt` 等），`build_cookie()` 直接返回它，`_canary_probe` 通常也会判健康，匿名 403 基本消除。代价是 Cookie 有过期时间，需定期重新复制。
+**结论**：Web 接口在纯 HTTP 下已被彻底封死。**第三方 App（如「即存」）能用是因为它是原生 App，走 App 端协议而非 Web 签名协议**——不是它的"解析算法更先进"。
 
-> 注：`gen_false_msToken()` 每次调用都是**随机**串（`gen_random_str(126)+"=="`），所以「3 次重试 msToken 相同」的观感其实是 f2 `BaseRequestModel.msToken` **导入期**生成的类属性（只生成一次），并非本工具 cookie 里的 msToken——**不是根因**，无需为此改动。真正的变量是 a_bogus 签名算法。
+**应对（v0.6.0 起新增浏览器回退，见下节）**：
+
+- **① 浏览器回退解析 `browser_fallback.py`（当前主力）**：不自己实现签名，而是**借真实浏览器生成签名**——脚本拉起 headless Chrome（`--remote-debugging-port`），用 CDP 导航到视频页，等播放器把 `<video>` 填上直链后取走。零新增第三方依赖（`websockets` 由 f2 依赖链带入），不需登录、不需用户 cookie。
+- **② 连通性探针（金丝雀）`_canary_probe`**：批量下载前探测 f2 接口；`resolve_mode=auto` 时探针失败**自动降级浏览器并继续**，不再 `sys.exit(2)` 中止。
+- **③ 真实登录态 Cookie `login_cookie`**：填入浏览器登录后的完整 Cookie。注意——登录态只能绕过**风控**，**无法绕过签名校验**（签名是服务端的硬要求，与是否登录无关）。
+- **④ 依赖自检 `_check_deps_fresh`**：一旦 f2 发布新版自动升级并重启。当前仍是 no-op。
+
+### v0.6.0：浏览器回退解析（`browser_fallback.py`）
+
+**设计目标**：抖音 Web 接口签名被封死后，仍要能免登录下载。
+
+**做法**：不自己实现签名，而是**借真实浏览器生成签名**。
+
+| 环节 | 实现 |
+| --- | --- |
+| 拉起浏览器 | `ChromeLauncher`：自选空闲端口 + `--headless=new` + 独立临时 profile（不污染用户日常 profile），轮询 `/json/version` 判就绪 |
+| 驱动 | `_CDPSession`：WebSocket JSON（标准库 + `websockets`），只用 `Page.*`/`Runtime.evaluate` |
+| **覆盖 UA** | 必须 `Emulation.setUserAgentOverride`——默认 headless UA 含 `HeadlessChrome`，抖音 CDN 会识别该特征 |
+| 取直链 | `Runtime.evaluate` 轮询 `<video>.currentSrc`，直到非空或超时 |
+| 直链筛选 | `_pick_best_src`：**① `__vid` 与目标 aweme_id 一致 → ② 抖音 VOD 域名 → ③ 码率高**。第①条最关键——页面里还有站点引导视频，误取会下载到无关内容 |
+| 元数据 | 文案取 `h1.innerText`；合集名从 `[data-e2e="video-detail"]` 里正则 `合集 · xxx`；昵称取 `a[href*="/user/"]` 并**过滤「关注/粉丝/我的」等按钮词**（它们同样指向 `/user/`） |
+| 合集 | `_collect_mix_ids` 从合集页 `a[href*="/video/"]` 收集 aweme_id（滚动加载，连续 3 轮无新增即停），再**逐条**走单视频解析 |
+| 清理 | 标签页用完即关（成功/失败都关），浏览器 `terminate()` + 删临时 profile |
+
+**实测行为**：
+- 单视频解析约 **5 秒**（等播放器起播），远快于人工排查签名。
+- 合集页 `/collection/{id}` 会 **302 到合集第一个视频**（标题即"第1课"），列表以 `a[href*="/video/"]` 出现在侧栏——这是发现合集条目的唯一可用途径。
+- 单条解析失败不影响同批其它条目（对齐原版 4.2「探针失败只作废这一条」）。
+
+**`resolve_mode` 三态**（`config.yaml`）：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto`（默认） | 先 f2，探测到系统性 403 自动降级浏览器；降级后**记在 config 上**，同批后续不再重复试 f2 |
+| `f2` | 只用 f2（快，但签名被封时整体失败） |
+| `browser` | 只用浏览器（慢但稳，不依赖 f2） |
+
+`_is_systemic_block()` 区分「系统性拦截」与「偶发风控」：含 `403`/`Forbidden`/`ArgusSecurityPlugin` 等特征才降级，偶发 403 仍按原逻辑重试（避免把正常抖动也拖去开浏览器）。
+
+> **注意**：`login_cookie` 只挡风控，**挡不住签名校验**。v0.6.0 之前文档暗示"填 Cookie 是一劳永逸绕过手段"，在签名问题上这个说法不准确——签名是服务端硬要求。Cookie 仍有价值（减少偶发 403），但不是解法。
+
+### v0.6.0：并发分段下载引擎（`download_engine.py`）
+
+移植自第三方 App「即存」的原生下载引擎 `jicun-dl`（Kotlin `NativeDownloader`），源码分析见 `/Users/zhenxi/codes/Android/即存_jicun-dl下载引擎源码解析.md`。
+
+**移植对照**（完整表见 `download_engine.py` 模块 docstring）：
+
+| 原 Kotlin | 本模块 | 作用 |
+| --- | --- | --- |
+| `DEFAULT_LANES = 32` | `dl_lanes` | 每文件并发连接数 |
+| `FILE_CONCURRENCY = 4` | `dl_file_concurrency` | 同时下几个文件 |
+| 探针 `Range: bytes=0-0` | `_probe()` | 一次拿总长/Content-Type/是否认 Range |
+| `AtomicLong` 共享游标 | `itertools.count()` | **谁空谁认领下一段** |
+| `RandomAccessFile.seek(start)` | `os.pwrite(fd, data, offset)` | 直接写偏移，**不落 .part、不拼接** |
+| `TransferInterrupted(written)` | `_TransferInterrupted` | 带已写入字节数，从断点续 |
+| `shouldRotateConnection` | `_should_rotate()` | 按「用多久没收完」判慢连接 |
+| `ChunkAttempts` | `_ChunkAttempts` | 按「有无进展」记账，非固定次数 |
+
+**核心设计（值得记住的三点）**：
+
+1. **共享游标而非固定分片**：固定切分的总耗时 = 最慢那条 lane。共享游标让先空出来的 lane 继续认领后面的段，**慢连接只拖住它手里那一段**。原版实测能快近一倍。
+2. **尾部切小段**：文件尾部 32MB 内切成 1MB（而非 4MB）——实测收尾时慢连接拖住一个 4MB 段要 8.5s，切到 1/4 后拖累按 1/4 计。
+3. **`Accept-Encoding: identity` 固定**：带 Range 请求要 gzip 自相矛盾，压缩会破坏字节偏移。引擎里若发现响应真的被压缩，**直接判失败**而非冒险写坏文件。
+
+**实测验证（2026-10-10，本机）**：
+
+| 场景 | 结果 |
+| --- | --- |
+| 分段计划（1MB / 6MB / 20MB / 200MB / 2GB / 7GB） | 覆盖完整、区间连续、段数 ≤64 全部通过 |
+| 64MB 本地服务，32/64 路并发 | **SHA256 与源完全一致** |
+| 目标视频分段 vs 单连接 | **逐字节一致** |
+| **35% 概率随机断连**（48MB，36 段，16 路） | 18 次重试后**收敛，SHA256 一致** |
+| 4xx（404） | 立即失败不重试 |
+| 单连接模式 vs 并发模式 | 产物逐字节一致 |
+
+**踩过的两个坑（已修，勿回退）**：
+
+1. **`httpx.aiter_bytes` 会缓冲到凑满 `chunk_size` 才吐出** → 连接在半个 chunk 处被重置时，缓冲里已到达的字节被**静默丢弃**，表现为「每次重试都零进展、4 次后误判段失败」。**必须用 `aiter_raw`**，收到多少吐多少，断点续传才拿得到已收字节。
+2. **`written` 必须提到 `try` 外层**：无论以何种异常中断（协议错误/超时/EOF），都要带着「本次已写入多少字节」去记账。放在 `try` 内会被重置成 0，退化成每次从段首重传。
+
+**已知边界**：
+- 服务端忽略 Range（回 200）→ 自动退化为整条顺序下载，此时并发无效。
+- 段数会被 `MAX_SEGMENTS=64` 收敛，故大文件段长会被放大（7GB → 64 段 × 100MB）。
+- `dl_lanes` 会被「段数」自然收敛：4MB 的视频只分 1 段，就只开 1 条连接。**小文件看不到并发收益是正常的**，收益在大文件上。
+- `dl_connection_budget` 是按 4MB 段设计的；改 `dl_segment_bytes` 时建议同步调整（否则大段会被误判"慢"而反复轮换）。
 
 ## 关键坑点（改动前必读）
 
 - **代理**：前文已强调，运行与代码两层都要禁用代理，否则请求异常。
+- **浏览器路径需要本机 Chrome/Edge/Chromium**：没有则 `BrowserNotFoundError`。可用 `DOUYINDL_CHROME_PATH` 环境变量指定。headless 下必须覆盖 UA（默认含 `HeadlessChrome` 会被识别）。
+- **浏览器路径拿不到的东西**：`cover`（封面）、`music_play_url`（原声）、`duration/width/height` 等 API 侧元数据全部为空。故 `_from_browser_resolved` 把 `music_status` 置 0（跳过原声下载），且 `save_metadata` 开启时只会产出 `.txt`/`.json`，不会有 `.jpg`/`.mp3`。
+- **浏览器路径慢**：单条约 5 秒（等播放器起播），远慢于纯 HTTP。合集逐条解析，N 条视频约 `5N` 秒 —— 这是用稳定性换速度的取舍。
 - **UA 一致性**：改 UA 必须同步 f2 的 conf.yaml，否则签名失败。
 - **`timeout` 不一致**：`config.timeout`（默认 15s）用于 API/链接解析；视频下载用硬编码 60s。调超时注意区分。
 - **`max_tasks=1`**：`config.yaml` 默认单任务，控制并发不要盲目调高以免触发风控。
@@ -159,4 +254,25 @@ douyinDL/
 - `docs/05-progress.md` 进度持久化与数据库结构
 - `docs/06-usage.md` 使用指南与 Skill 集成
 - `docs/07-faq.md` 排查/扩展方向/代码索引/依赖清单/变更记录
+
+---
+
+## 变更记录
+
+### v0.6.0（2026-10-10）—— 应对抖音签名封杀 + 并发下载引擎
+
+用户实测：第三方 App（即存）在模拟器上能免登录下载同一视频，本工具却因系统性 403 完全不可用。排查结论与改造：
+
+| 改动 | 文件 | 说明 |
+| --- | --- | --- |
+| 新增浏览器回退解析 | `browser_fallback.py` | 借 headless Chrome + CDP 取直链，绕开 Web 签名 |
+| 新增并发分段下载引擎 | `download_engine.py` | 移植 jicun-dl，含探针/共享游标/续传/慢连接轮换 |
+| 解析策略三态 + 自动降级 | `downloader.py` | `resolve_mode: auto/f2/browser`，`_is_systemic_block` 区分系统性 vs 偶发 |
+| 金丝雀不再直接中止 | `downloader.py` | auto 模式下探针失败自动降级浏览器并继续 |
+| `download_video` 接并发引擎 | `downloader.py` | `concurrent_download=false` 可退回单连接 |
+| 新增 11 个配置项 | `config/config.yaml` | 解析策略 3 项 + 并发引擎 8 项 |
+
+**实测结果**（目标链接 `https://v.douyin.com/ti6iWTa_muM/`）：单条与合集（3 条）均下载成功，QuickLook 能解码出缩略图，进度库正常入库。
+
+**同时修正了文档里一处不准确表述**：v0.6.0 之前称「填 `login_cookie` 是唯一可靠的一劳永逸绕过手段」——实测登录态**无法**绕过签名校验（签名是服务端硬要求，与登录无关），该说法已在 CLAUDE.md 中更正。
 - `docs/08-share-link-mechanism.md` 分享链接机制：为何同视频多次分享得到不同短链、aweme_id 去重原理

@@ -129,6 +129,10 @@ uv run python -m douyindl "<链接>" -m
 | 随机间隔 | 下载间隔改为 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别 |
 | 下载限速 | 新增 `max_download_speed` 配置参数，支持限制最大下载速度（字节/秒，0 不限速） |
 
+> 里程碑与 git tag 的对应关系：初始版本~下载限速为 v0.2.0 ~ v0.4.x（无 tag）；
+> 前置检查机制（依赖自检 + 金丝雀 + `login_cookie`）为 **v0.5.0**；
+> 浏览器回退解析 + 并发分段下载引擎为 **v0.6.0**（详见 CLAUDE.md「变更记录」）。
+
 ## 文档导航
 
 - [01-getting-started.md](01-getting-started.md) - 项目入门
