@@ -14,12 +14,18 @@
 """
 
 import asyncio
+import importlib.metadata
 import json
+import logging
+import os
 import random
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -59,6 +65,7 @@ from f2.apps.douyin.utils import TokenManager
 from f2.exceptions import (
     APIResponseError,
     APIRateLimitError,
+    APIUnauthorizedError,
     APIConnectionError,
     APITimeoutError,
 )
@@ -162,6 +169,15 @@ class Config:
         # 日志：控制台级别（默认 INFO）、日志文件路径（默认 app.log，文件固定 DEBUG）
         self.log_level = data.get("log_level", "INFO")
         self.log_file = data.get("log_file", "app.log")
+
+        # ── 认证 / 前置检查 ──
+        # 真实登录态 Cookie：填入可绕过抖音匿名风控 403（需含 sid_tt/sess 等登录字段）。
+        # 留空则使用匿名会话（真实 ttwid + 假 msToken），抖音可能间歇性/系统性 403。
+        self.login_cookie = data.get("login_cookie", "") or ""
+        # 依赖自检：启动时检查 f2 最新版，有更新则自动升级后重启（实现「下载前先更新依赖」）
+        self.preflight_check_deps = bool(data.get("preflight_check_deps", True))
+        # 连通性探针（金丝雀）：批量下载前探测接口是否可用，整体被拦截则提前中止
+        self.preflight_canary = bool(data.get("preflight_canary", True))
 
     @property
     def default_headers(self) -> Dict[str, str]:
@@ -286,9 +302,16 @@ def _warm_up_session(config: "Config") -> str:
 
 
 def build_cookie(config: Optional["Config"] = None) -> str:
-    """生成匿名 cookie：优先复用预热得到的首页 cookie（__ac_nonce 等），
-    再补一个真实 ttwid（每次新鲜，保留重试「换新会话」机制）与假 msToken。
+    """生成 cookie。
+
+    - 若 config.login_cookie 非空：直接使用用户提供的真实登录态 Cookie，
+      绕过匿名风控（抖音对匿名 a_bogus 签名会系统性 403）。这是「一劳永逸」
+      绕过风控的核心手段；真实 Cookie 已含 ttwid/msToken/sid_tt 等全部字段。
+    - 否则：生成匿名 cookie——优先复用预热得到的首页 cookie（__ac_nonce 等），
+      再补一个真实 ttwid（每次新鲜，保留重试「换新会话」机制）与假 msToken。
     config 为 None 时（极少路径）回退到裸 ttwid + 假 msToken。"""
+    if config is not None and getattr(config, "login_cookie", ""):
+        return config.login_cookie.strip()
     ms_token = TokenManager.gen_false_msToken()
     if config is None:
         ttwid = TokenManager.gen_ttwid()
@@ -1704,6 +1727,131 @@ class _NullContext:
         pass
 
 
+# ── 前置检查（每次下载前执行） ─────────────────────────────────
+# 把「抖音服务端变更导致匿名接口系统性 403」这类问题在批量下载前就暴露出来，
+# 而不是对每个链接反复重试 3 次、把整批误写进 urls_fail。两类检查：
+#   1. 依赖自检：确认 f2 是否为最新版（落地用户「每次下载前先更新依赖库」诉求）；
+#      若 PyPI 有更新则自动升级并重启，无网络时静默跳过。
+#   2. 连通性探针（金丝雀）：用若干已知公开视频探测接口是否可用；若全部 403
+#      （风控拦截），判定「下载方法当前整体失效」，提前中止并给出可操作建议。
+
+try:
+    _F2_VERSION = importlib.metadata.version("f2")
+except Exception:
+    _F2_VERSION = "0.0.1.7"
+
+# 金丝雀候选：覆盖若干公开视频 aweme_id。只要任意一个「接口可达」即判定方法健康；
+# 仅当全部返回 403/风控 才判定方法整体被服务端拦截。候选视频若已删除/私密，
+# 属「接口正常、仅该视频不可用」，同样视为健康。
+_CANARY_AWEME_IDS = (
+    "7680879925243711922",  # 用户曾报告的视频
+    "7308976139259642670",
+    "6943263674634496287",
+)
+
+
+def _check_deps_fresh(config: "Config") -> None:
+    """依赖自检：检查 f2 最新版，必要时自动升级后重启当前进程。
+
+    实现「每次下载前先更新依赖库」的诉求。f2 一旦发布适配抖音新签名的版本，
+    本工具会在下次运行时自动检测、升级并重启，加载新版后继续下载。
+    无网络 / PyPI 不可达时静默跳过，不阻碍主流程。
+    """
+    if not getattr(config, "preflight_check_deps", True):
+        return
+    import json
+    latest = None
+    try:
+        req = urllib.request.Request(
+            "https://pypi.org/pypi/f2/json",
+            headers={"User-Agent": "douyindl-preflight/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            latest = json.loads(resp.read().decode("utf-8")).get("info", {}).get("version")
+    except Exception as e:
+        logger.debug(f"依赖自检：无法连接 PyPI，跳过自动更新（{_short_err(e)}）")
+        return
+
+    if not latest or latest == _F2_VERSION:
+        logger.debug(f"依赖自检：f2 已是最新版（{_F2_VERSION}）")
+        return
+
+    logger.warning(f"依赖自检：检测到 f2 新版本 {_F2_VERSION} → {latest}，正在自动升级…")
+    project_root = Path(__file__).resolve().parent.parent.parent
+    uv_bin = shutil.which("uv") or "uv"
+    rc = subprocess.run(
+        [uv_bin, "pip", "install", f"f2=={latest}"],
+        cwd=str(project_root),
+    )
+    if rc.returncode == 0:
+        logger.info("依赖自检：f2 已升级，正在用新版本重新启动…")
+        # venv 已被 uv 更新；用同一解释器重跑本命令，加载新版 f2 后继续
+        os.execv(sys.executable, [sys.executable, "-m", "douyindl"] + sys.argv[1:])
+    else:
+        logger.error(
+            f"依赖自检：自动升级失败（uv 返回 {rc.returncode}），"
+            f"请手动运行 `uv pip install -U f2` 后重试"
+        )
+
+
+async def _probe_single(aweme_id: str, config: "Config") -> str:
+    """探测单个视频接口可用性，返回 OK / NOT_FOUND / BLOCKED / UNKNOWN。"""
+    try:
+        cookie = build_cookie(config)
+        kwargs = build_crawler_kwargs(cookie, config)
+        kwargs["max_retries"] = 1  # 探针只试一次，不浪费重试
+        async with DouyinCrawler(kwargs) as crawler:
+            resp = await crawler.fetch_post_detail(PostDetail(aweme_id=aweme_id))
+        if isinstance(resp, dict) and resp.get("aweme_detail"):
+            return "OK"
+        # 接口可达但视频已删除/私密 → 方法本身健康
+        return "NOT_FOUND"
+    except (APIResponseError, APIUnauthorizedError):
+        # 403 / 未授权 → 疑似风控拦截
+        return "BLOCKED"
+    except Exception as e:
+        logger.debug(f"金丝雀探测异常（{aweme_id}）：{_short_err(e)}")
+        return "UNKNOWN"
+
+
+async def _canary_probe(config: "Config") -> bool:
+    """连通性探针：若抖音服务端整体拦截匿名接口（全部 403），返回 False。
+
+    Returns:
+        True  → 可继续批量下载（方法健康或探针结论不确定，不应贸然中止）。
+        False → 下载方法当前整体失效，调用方应中止并给出建议。
+    """
+    outcomes: List[str] = []
+    for aid in _CANARY_AWEME_IDS:
+        st = await _probe_single(aid, config)
+        logger.debug(f"金丝雀探测 {aid}: {st}")
+        # 任一「接口可达」即判定方法健康，立即返回
+        if st in ("OK", "NOT_FOUND"):
+            return True
+        outcomes.append(st)
+    # 没有任何一个接口可达
+    if outcomes and all(s == "BLOCKED" for s in outcomes):
+        return False
+    # 存在 UNKNOWN（网络异常等）→ 不贸然中止
+    return True
+
+
+def _report_method_blocked() -> None:
+    """当金丝雀判定方法整体失效时，输出清晰、可操作的诊断信息。"""
+    logger.error(
+        f"抖音服务端已变更风控：当前 f2 {_F2_VERSION} 的匿名签名（a_bogus）"
+        f"被服务端拒绝（403），下载方法整体失效。"
+    )
+    logger.error(
+        "这不是代码 bug，也不是依赖过期（已确认 f2 为最新版、且会检测到新版自动升级）。"
+    )
+    logger.error(
+        "可选对策：① 等待 f2 发布适配新签名的新版（工具已自动检测，有更新会自升级并重启）；"
+        "② 在 config.yaml 填入真实登录态 Cookie（login_cookie）绕过匿名风控；"
+        "③ 更换网络 IP / 稍后重试。"
+    )
+
+
 def main():
     """CLI 入口：python -m douyindl <分享链接> [输出目录]
 
@@ -1777,6 +1925,22 @@ def main():
         level="DEBUG" if args.verbose else config.log_level,
         log_file=config.log_file,
     )
+
+    # ── 前置检查 1：依赖自检（可能自动升级 f2 并重启当前进程） ──
+    _check_deps_fresh(config)
+
+    # ── 前置检查 2：连通性探针（金丝雀）──
+    # 若抖音服务端整体拦截匿名接口（全部 403），提前中止并给出可操作建议，
+    # 避免对每个链接反复重试 3 次、把整批误写进 urls_fail。
+    if config.preflight_canary:
+        try:
+            healthy = asyncio.run(_canary_probe(config))
+        except Exception as e:
+            logger.warning(f"前置探针异常，跳过（{_short_err(e)}）")
+            healthy = True
+        if not healthy:
+            _report_method_blocked()
+            sys.exit(2)
 
     # 会话预热：先访问抖音首页拿到首页 cookie，降低后续 API 首打 403 概率
     # （仅执行一次，结果缓存；失败不影响主流程，回退裸 ttwid）

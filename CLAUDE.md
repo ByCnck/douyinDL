@@ -75,7 +75,7 @@ douyinDL/
 
 - **`Config`**：从 `config.yaml` 加载，逐项带默认值兜底；`DEFAULT_CONFIG_PATH` 由 `__file__` 向上三级定位到项目根 `config/config.yaml`。
 - **`resolve_share_url`**：支持短链 `v.douyin.com`、合集 `iesdouyin.com/share/mix/detail/{id}` 或 `douyin.com/collection/{id}`、单视频 `douyin.com/video/{id}`；短链跟随重定向后用正则 `_MIX_PATH_PATTERN` / `_AWEME_ID_PATTERN` 提取 `mix`/`one` 类型与 ID。
-- **匿名认证**：`build_cookie(config)` 优先复用「会话预热」拿到的首页 cookie（`__ac_nonce` 等），再补真实 `ttwid`（`gen_ttwid()`，每次新鲜）+ 假 `msToken`（`gen_false_msToken()`）；无需登录。根因见「403 风控根因与应对」节。
+- **匿名认证**：`build_cookie(config)` 优先复用「会话预热」拿到的首页 cookie（`__ac_nonce` 等），再补真实 `ttwid`（`gen_ttwid()`，每次新鲜）+ 假 `msToken`（`gen_false_msToken()`）；无需登录。若 `config.login_cookie` 非空则直接返回该真实 Cookie、跳过匿名生成（绕过匿名风控，详见同节「系统性 403」）。根因见「403 风控根因与应对」节。
 - **视频列表**：`fetch_mix_videos`（分页循环，受 `page_counts`/`api_request_interval` 节流）与 `fetch_one_video`，分别用 f2 的 `UserMixFilter._to_list()` 与 `PostDetailFilter._to_dict()`。
 - **API 请求重试层**：`fetch_one_video` 与 `fetch_mix_videos` 的接口调用统一经 `_request_with_retry` 包裹。原因：f2 的 `base_crawler.handle_http_status_error` 对 403/429/5xx 等 HTTP 状态错误是 `else` 分支**直接抛异常、不进入重试循环**（它只在响应为空时才重试）。抖音对 `aweme/detail` 等接口存在**间歇性风控（偶发 403 Forbidden）**，表现为批量下载时零星失败——而换新会话（换 PC 链接/重跑）往往就成功。本层补上重试：**每次重试都重新生成匿名 ttwid cookie（换会话）**，退避用 `_random_interval(max(api_request_interval, 2.0))`，仅对 `APIResponseError`/`APIRateLimitError`/`APIConnectionError`/`APITimeoutError` 重试，逻辑错误不重试。重试次数由 `config.api_max_retries`（默认 3）控制。另见「会话预热」：启动先 GET 抖音首页并入首页 cookie 进一步降低首打 403；`config.api_request_interval` 调大（默认 5.0s）亦可降首打概率（详见「403 风控根因与应对」节）。
 - **`_extract_video_meta`**：f2 filter 会丢失 `video.*` 嵌套字段，此函数从原始 JSON 补提（duration/width/height/file_size/bit_rate/fps/ratio/video_format/is_h265/作者/统计/创建时间），用于入库。
@@ -103,6 +103,26 @@ douyinDL/
 - **会话预热**：启动（CLI `main()`）时先 GET 抖音首页，把首页下发的 cookie（`__ac_nonce` 等）并入后续所有 API 请求（`_warm_up_session()`，结果缓存一次）。作用：让请求比纯裸 ttwid 更像「连续会话」。
   - 局限：`sid_tt`/`odin_tt` 等需浏览器 JS 才下发，纯 HTTP 拿不到，故预热只能补充首页少量 cookie + 真实 ttwid，无法完全模拟登录态浏览器；要进一步降 403 需引入无头浏览器（playwright）取完整 cookie 罐——当前未做。
 - 重试次数 `api_max_retries`（默认 3）兜底最终失败；仍失败则写入 `urls_fail`（`时间 原因 url`）供手工重试。
+
+### 系统性 403（服务端签名更新）—— 与「间歇性概率 403」不同
+
+上述是**间歇性、按次概率**的 403（重试换会话即可成功）。还存在另一种**系统性、必然**的 403：某天开始所有请求（含换新 ttwid 重试 3 次）**全部 403**，无论重试多少次都不成功。
+
+**根因（2026-10 实测确认）**：抖音**服务端更新了对匿名 `a_bogus` 签名的校验**，f2 0.0.1.7 内置的 a_bogus 算法（2024 年开源版，`f2/utils/abogus.py`，`@version 0.0.2`）已被服务端拒绝。证据链：
+
+1. **「依赖过期」假设不成立**：`uv pip install --dry-run "f2>0.0.1.7"` 结果 `Because only f2<=0.0.1.7 is available ... unsatisfiable` —— **f2 0.0.1.7 即 PyPI 最新版，无更新可升**。所以「第三方库有更新但本地没更新」不是原因。
+2. **非本机 IP 单封**：在**完全不同 IP/网络**的干净环境实测同一 `aweme/detail` 接口，同样返回 403（请求中带 f2 的 a_bogus 签名）。说明是**全局服务端校验变更**，不是用户本机 IP 被风控。
+3. **不是本地代码 bug**：本工具未改签名算法，只是调用 f2；f2 的算法与服务端不再匹配。
+
+**结论**：匿名（免登录）下载器的「一劳永逸」在抖音持续改服务端的前提下**无法实现**——只要服务端轮换 a_bogus 校验且 f2 未跟进，匿名接口就会系统性失效。能做的是**快速暴露 + 给出可操作出路**，而非假装修好。
+
+**应对（已落地为「前置检查」，每次下载前执行）**：
+
+- **① 依赖自检 `_check_deps_fresh`**：启动时查 PyPI 的 f2 最新版；一旦 f2 发布适配新签名的新版，自动 `uv pip install` 升级并 `os.execv` 重启当前进程加载新版，**无需人工干预即跟进**。当前无新版时是 no-op，但把「下载前先更新依赖库」变成真实机制。
+- **② 连通性探针（金丝雀）`_canary_probe`**：批量下载**前**，用若干已知公开视频（`_CANARY_AWEME_IDS`）各探测一次 `aweme/detail`。只要任意一个「接口可达」（含视频已删/私密，均视为接口正常）即判定方法健康、放行；**仅当全部返回 403/风控**才判定「方法整体失效」，立即 `_report_method_blocked()` 打印清晰诊断并 `sys.exit(2)` 中止，**避免对每个链接反复重试 3 次、把整批误写进 `urls_fail`**。探针异常（网络问题）不贸然中止。
+- **③ 真实登录态 Cookie 绕过 `login_cookie`**：这是**当前唯一可靠的「一劳永逸」绕过手段**。在 `config.yaml` 填入浏览器登录后的完整 Cookie（含 `sid_tt`/`sess`/`odin_tt` 等），`build_cookie()` 直接返回它，`_canary_probe` 通常也会判健康，匿名 403 基本消除。代价是 Cookie 有过期时间，需定期重新复制。
+
+> 注：`gen_false_msToken()` 每次调用都是**随机**串（`gen_random_str(126)+"=="`），所以「3 次重试 msToken 相同」的观感其实是 f2 `BaseRequestModel.msToken` **导入期**生成的类属性（只生成一次），并非本工具 cookie 里的 msToken——**不是根因**，无需为此改动。真正的变量是 a_bogus 签名算法。
 
 ## 关键坑点（改动前必读）
 

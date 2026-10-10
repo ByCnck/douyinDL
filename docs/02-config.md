@@ -99,6 +99,19 @@ uv run python -m douyindl "<链接>" -c /path/to/custom-config.yaml
 >
 > 运行时加 `-v/--verbose` 可让控制台也降到 `DEBUG`，显示步骤细节（文件始终为 DEBUG）。
 
+## 认证与前置检查
+
+> 这一组配置用于应对「抖音服务端变更导致匿名接口系统性 403」的情况。
+> 根因与整体策略见 CLAUDE.md「403 风控根因与应对」节的「系统性 403（服务端签名更新）」小节。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `login_cookie` | string | `""` | **真实登录态 Cookie（绕过匿名风控的核心手段）**。留空则用匿名会话（真实 ttwid + 假 msToken），抖音可能间歇性/系统性 403。填入后 `build_cookie()` 直接返回该字符串，不再走匿名生成。获取方式：抖音网页端登录后，F12 → Network → 任意请求 → Request Headers 的 `Cookie` 整串复制填入，**需含 `sid_tt`/`sess`/`uid_tt`/`odin_tt` 等登录字段**。注意登录 Cookie 有有效期，过期需重新复制；失效时接口仍会 403 |
+| `preflight_check_deps` | bool | `true` | **依赖自检**：启动时查询 PyPI 的 f2 最新版，若比本地新则自动 `uv pip install` 升级并重启当前进程（即「每次下载前先更新依赖库」的落地）。网络不可达时静默跳过，不影响主流程 |
+| `preflight_canary` | bool | `true` | **连通性探针（金丝雀）**：正式批量下载前，用若干已知公开视频探测 `aweme/detail` 接口是否可用。若全部返回 403（风控拦截），判定「下载方法当前整体失效」，提前中止并打印可操作建议，**避免对每个链接反复重试 3 次、把整批误写进 `urls_fail`**。除非你明确要无视探针强行尝试，否则保持 `true` |
+
+> **何时需要 `login_cookie`**：当你确认 `preflight_canary` 触发、诊断信息指向「匿名 a_bogus 被服务端拒绝」时，最稳的绕过方式就是提供真实登录态 Cookie——它让请求带完整登录上下文，绝大多数情况下可彻底消除匿名 403。这是当前「一劳永逸」绕过风控的唯一可靠手段（等待 f2 适配新签名是另一条路径，工具已通过 `preflight_check_deps` 自动跟进）。
+
 ## 配置覆盖优先级
 
 从高到低：
@@ -150,6 +163,14 @@ output_dir: "./downloads"
 # 日志相关
 log_level: "INFO"
 log_file: "app.log"
+
+# 认证与前置检查
+# 真实登录态 Cookie（可选）：绕过匿名风控 403 的核心手段，需含 sid_tt/sess 等登录字段
+login_cookie: ""
+# 依赖自检：启动时检查 f2 最新版，有更新则自动升级并重启
+preflight_check_deps: true
+# 连通性探针（金丝雀）：批量下载前探测接口是否可用，整体被拦截则提前中止
+preflight_canary: true
 ```
 
 ## 下一步
