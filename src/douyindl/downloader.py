@@ -676,21 +676,28 @@ def _from_browser_resolved(r) -> Dict[str, Any]:
 
     字段对齐 `PostDetailFilter._to_dict()` 的子集，保证下游
     `_build_video_name` / `download_metadata` / `ProgressDB.record` 无需改动。
+
+    v0.7.0：浏览器路径改为拦截 `aweme/detail` 响应体后，`r.raw_aweme` 里是
+    完整的 aweme_detail，因此封面/原声/时长等元数据**不再是缺失**，
+    可直接复用 `_extract_video_meta`（与 f2 路径同一套提取逻辑）。
     """
     name = _build_video_name(r.desc, r.aweme_id, 60)
+    # 完整 aweme_detail 走统一的元数据提取；兜底（旧 DOM 路径）只有昵称
+    if r.raw_aweme:
+        meta = _extract_video_meta(r.raw_aweme)
+    else:
+        meta = {"nickname": r.nickname or None}
     return {
         "aweme_id": r.aweme_id,
         "desc": r.desc,
         "video_play_addr": r.play_url,
-        "music_status": 0,          # 浏览器解析拿不到原声地址，置 0 跳过
-        "music_play_url": None,
-        "cover": "",                 # 同上，封面留空
+        # 原声可用性：接口返回了 play_url 才置 1（下游据此决定是否下载 mp3）
+        "music_status": 1 if r.music_play_url else 0,
+        "music_play_url": r.music_play_url or None,
+        "cover": r.cover_url or "",
         "is_image_note": False,
         "images": [],
-        "_meta": {
-            # 浏览器路径拿不到 API 侧的完整元数据，只填可从页面得到的
-            "nickname": r.nickname or None,
-        },
+        "_meta": meta,
         "_resolved_by": "browser",
     }
 

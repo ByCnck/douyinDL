@@ -146,18 +146,13 @@ douyinDL/
 | 环节 | 实现 |
 | --- | --- |
 | 拉起浏览器 | `ChromeLauncher`：自选空闲端口 + `--headless=new` + 独立临时 profile（不污染用户日常 profile），轮询 `/json/version` 判就绪 |
-| 驱动 | `_CDPSession`：WebSocket JSON（标准库 + `websockets`），只用 `Page.*`/`Runtime.evaluate` |
+| 驱动 | `_CDPSession`：WebSocket JSON（标准库 + `websockets`）。**唯一读循环 + Future 分发**（见 v0.7.0 踩坑） |
 | **覆盖 UA** | 必须 `Emulation.setUserAgentOverride`——默认 headless UA 含 `HeadlessChrome`，抖音 CDN 会识别该特征 |
-| 取直链 | `Runtime.evaluate` 轮询 `<video>.currentSrc`，直到非空或超时 |
-| 直链筛选 | `_pick_best_src`：**① `__vid` 与目标 aweme_id 一致 → ② 抖音 VOD 域名 → ③ 码率高**。第①条最关键——页面里还有站点引导视频，误取会下载到无关内容 |
-| 元数据 | 文案取 `h1.innerText`；合集名从 `[data-e2e="video-detail"]` 里正则 `合集 · xxx`；昵称取 `a[href*="/user/"]` 并**过滤「关注/粉丝/我的」等按钮词**（它们同样指向 `/user/`） |
-| 合集 | `_collect_mix_ids` 从合集页 `a[href*="/video/"]` 收集 aweme_id（滚动加载，连续 3 轮无新增即停），再**逐条**走单视频解析 |
+| 取直链 | ~~`Runtime.evaluate` 轮询 `<video>.currentSrc`~~ **v0.7.0 已改为拦截 `aweme/detail` 响应体**，本项仅作兜底 |
+| 直链筛选 | `_pick_best_src`（兜底路径用）：**① `__vid` 与目标 aweme_id 一致 → ② 抖音 VOD 域名 → ③ 码率高** |
+| 元数据 | ~~文案取 `h1.innerText`~~ **v0.7.0 起从接口 JSON 取全**（封面/原声/时长/分辨率/码率/作者/统计） |
+| 合集 | `_collect_mix_ids` 从合集页 `a[href*="/video/"]` 收集 aweme_id（滚动加载），再**逐条**走单视频解析 |
 | 清理 | 标签页用完即关（成功/失败都关），浏览器 `terminate()` + 删临时 profile |
-
-**实测行为**：
-- 单视频解析约 **5 秒**（等播放器起播），远快于人工排查签名。
-- 合集页 `/collection/{id}` 会 **302 到合集第一个视频**（标题即"第1课"），列表以 `a[href*="/video/"]` 出现在侧栏——这是发现合集条目的唯一可用途径。
-- 单条解析失败不影响同批其它条目（对齐原版 4.2「探针失败只作废这一条」）。
 
 **`resolve_mode` 三态**（`config.yaml`）：
 
@@ -170,6 +165,48 @@ douyinDL/
 `_is_systemic_block()` 区分「系统性拦截」与「偶发风控」：含 `403`/`Forbidden`/`ArgusSecurityPlugin` 等特征才降级，偶发 403 仍按原逻辑重试（避免把正常抖动也拖去开浏览器）。
 
 > **注意**：`login_cookie` 只挡风控，**挡不住签名校验**。v0.6.0 之前文档暗示"填 Cookie 是一劳永逸绕过手段"，在签名问题上这个说法不准确——签名是服务端硬要求。Cookie 仍有价值（减少偶发 403），但不是解法。
+
+### v0.7.0：改用拦截 `aweme/detail` 响应体（修复"MSE 视频解析失败"）
+
+**故障现象**：视频明明存在（页面标题/文案/播放均正常），却报
+`页面已加载但未取到视频直链…可能触发了验证码或视频已删除`。
+
+**根因（2026-10-10 实测定位）**：抖音 PC Web 播放器对**部分**视频启用 **MSE**
+（Media Source Extensions）。此时 `<video>.currentSrc` 是 `blob:` 而非 http 直链，
+真实地址在网络层且被拆成**两条独立流**：
+
+| URL 片段 | 内容 | MP4 轨（实测 box 解析） |
+| --- | --- | --- |
+| `.../media-video-avc1/` | 仅画面 | `['vide']` |
+| `.../media-audio-und-mp4a/` | 仅声音 | `['soun']` |
+
+两条都导致故障：
+
+1. **取不到直链 → 误报"视频已删除"**。v0.6.0 兜底 JS 用 `.mp4/.m4s/.m3u8` 扩展名正则过滤性能记录，而抖音 VOD 地址形如 `.../media-video-avc1/?a=6383&br=551...` —— **路径里没有扩展名**，连兜底也一并落空。
+   故障样本 `7680879925243711922` 实测：`<video>` 的 `readyState=4`、`duration=855s`、`paused=false`、`error=null`（**播放完全正常**），却因上述规则一个 url 都没匹配到。**是代码问题，不是视频被删。**
+2. **即便取到 MSE 流也是残缺文件**（无声或无画面），而非可播放 mp4。
+
+而 `aweme/detail` 响应里的 `video.bit_rate[]` / `video.play_addr` 是**渐进式合流** MP4（实测 moov 内同时含 `vide` 与 `soun`），这才是正确来源。
+
+**新做法**：`_DetailSniffer` 监听 `Network` 事件，**截下页面自己发出的 `aweme/detail` 响应体**并解析。既不自己实现签名，又拿到与 f2 接口**同构**的完整 JSON。
+
+| 环节 | 实现 |
+| --- | --- |
+| 拦截 | `Network.requestWillBeSent` 记录 `aweme/detail` 的 requestId → `loadingFinished` 时 `getResponseBody` 取回 |
+| 合流优选 | `_pick_best_muxed_url`：按 `bit_rate` 降序取**非 H.265** 最高档（兼容优先于画质） |
+| 显式排除 | URL 含 `media-audio` 的分片流一律跳过，避免下到无声文件 |
+| 元数据 | `_aweme_to_resolved` 一次拿全：直链/封面/原声/时长/分辨率/码率/作者/点赞评论数/创建时间 |
+| 兜底 | 拦截失败才回落 `<video>` 扫描（可能是 MSE 残缺流，仅作最后手段） |
+
+**实测收益**：单条约 **4~6 秒**（不必等播放器起播），且**封面/原声/时长等元数据从"全部缺失"变为完整可用**——`_from_browser_resolved` 复用 `_extract_video_meta`，与 f2 路径同一套提取逻辑，`save_metadata` 在浏览器路径下终于能产出 `.jpg`/`.mp3`/`.json`。
+
+**踩坑（已修，勿回退）**：
+
+1. **CDP 会话必须单读循环**。响应与事件走同一条 socket，原实现 `call()` 里直接 `recv()` 到匹配 id 就丢弃其余消息，无法监听事件。现改为唯一读循环 + Future 分发。
+2. **读循环里不得 await 需要 CDP 回包的命令**（如 `getResponseBody`），否则读循环自己挂起、永远收不到自己的回包 → **死锁**（实测表现为响应体永远拿不到、静默超时）。必须 `asyncio.create_task` 派发出去。
+3. **`Network.enable` 要开大缓冲**（`maxTotalBufferSize`/`maxResourceBufferSize`），否则 `aweme/detail`（可达数百 KB）响应体被回收、`getResponseBody` 取不到。
+4. **`_collect_mix_ids` 的收敛判据不能在"从未采到 id"时触发**。页面加载需数秒，期间 DOM 里一个 `<a href="/video/">` 都没有；把加载期空结果计入「无新增」会在列表渲染前就收敛、返回空列表并误报「合集页未列出任何视频」。
+   **但也不能改用 `document.readyState === "complete"` 作守卫**——`/collection/{id}` 会 302 到第一个视频页，`complete` 时侧栏已被**推荐流**灌满，采到的是与合集无关的视频（实测取到高考/ChatGPT/幼儿园等）。侧栏按渲染顺序出现、合集在前推荐在后，故只需保证"采到过 id 后才允许收敛"。
 
 ### v0.6.0：并发分段下载引擎（`download_engine.py`）
 
@@ -220,8 +257,9 @@ douyinDL/
 
 - **代理**：前文已强调，运行与代码两层都要禁用代理，否则请求异常。
 - **浏览器路径需要本机 Chrome/Edge/Chromium**：没有则 `BrowserNotFoundError`。可用 `DOUYINDL_CHROME_PATH` 环境变量指定。headless 下必须覆盖 UA（默认含 `HeadlessChrome` 会被识别）。
-- **浏览器路径拿不到的东西**：`cover`（封面）、`music_play_url`（原声）、`duration/width/height` 等 API 侧元数据全部为空。故 `_from_browser_resolved` 把 `music_status` 置 0（跳过原声下载），且 `save_metadata` 开启时只会产出 `.txt`/`.json`，不会有 `.jpg`/`.mp3`。
-- **浏览器路径慢**：单条约 5 秒（等播放器起播），远慢于纯 HTTP。合集逐条解析，N 条视频约 `5N` 秒 —— 这是用稳定性换速度的取舍。
+- **浏览器路径的元数据（v0.7.0 起已可用）**：改为拦截 `aweme/detail` 响应体后，封面/原声/时长/分辨率/码率/统计等**全部可得**，`save_metadata` 能正常产出 `.jpg`/`.mp3`/`.json`（v0.6.0 时这些全部为空）。仅**兜底路径**（拦截失败回落 `<video>`）拿不到元数据。
+- **不能只读 `<video>.currentSrc`**：抖音对部分视频走 MSE，`<video>` 上是 `blob:`，且网络层被拆成仅画面/仅声音两条流——既取不到直链，取到也是残缺文件。必须用 `aweme/detail` 里的 `bit_rate`/`play_addr` 合流地址。详见「v0.7.0」节。
+- **浏览器路径慢**：单条约 4~6 秒。合集逐条解析，N 条视频约 `5N` 秒 —— 这是用稳定性换速度的取舍。
 - **UA 一致性**：改 UA 必须同步 f2 的 conf.yaml，否则签名失败。
 - **`timeout` 不一致**：`config.timeout`（默认 15s）用于 API/链接解析；视频下载用硬编码 60s。调超时注意区分。
 - **`max_tasks=1`**：`config.yaml` 默认单任务，控制并发不要盲目调高以免触发风控。
@@ -276,3 +314,35 @@ douyinDL/
 
 **同时修正了文档里一处不准确表述**：v0.6.0 之前称「填 `login_cookie` 是唯一可靠的一劳永逸绕过手段」——实测登录态**无法**绕过签名校验（签名是服务端硬要求，与登录无关），该说法已在 CLAUDE.md 中更正。
 - `docs/08-share-link-mechanism.md` 分享链接机制：为何同视频多次分享得到不同短链、aweme_id 去重原理
+
+### v0.7.0（2026-10-10）—— 修复 MSE 视频「解析不到直链」误报
+
+用户实测：部分视频报 `页面已加载但未取到视频直链…可能触发了验证码或视频已删除`，
+但页面标题（文案）已正常取到，说明视频存在、即存 App 也能正常下载。
+
+排查结论与改造：
+
+| 改动 | 文件 | 说明 |
+| --- | --- | --- |
+| 主路径改为拦截接口响应体 | `browser_fallback.py` | 新增 `_DetailSniffer`，截下页面自己发出的 `aweme/detail` 响应体并解析 |
+| 合流直链优选 | `browser_fallback.py` | 新增 `_pick_best_muxed_url`，按码率取非 H.265 最高档，显式排除 `media-audio` 分片 |
+| CDP 会话重写 | `browser_fallback.py` | 单读循环 + Future 分发，支持事件监听；修掉读循环内 await 造成的死锁 |
+| 元数据补全 | `browser_fallback.py` / `downloader.py` | `BrowserResolved` 增 `cover_url`/`music_play_url`/`raw_aweme`；`_from_browser_resolved` 复用 `_extract_video_meta` |
+| 合集收敛判据修正 | `browser_fallback.py` | `_collect_mix_ids` 未采到过 id 时不判收敛（修掉加载期空结果导致的误报） |
+
+**根因**：抖音 PC Web 播放器对部分视频启用 MSE，`<video>.currentSrc` 是 `blob:`，
+真实地址在网络层且被拆成「仅画面 `media-video-*`」与「仅声音 `media-audio-*`」两条流；
+而 v0.6.0 兜底 JS 用 `.mp4/.m4s/.m3u8` 扩展名正则过滤，抖音 VOD 地址路径里没有扩展名，
+于是主路径与兜底同时落空 → 误报「视频已删除」。
+
+**实测结果**：
+
+| 验证项 | 结果 |
+| --- | --- |
+| 故障视频 `7680879925243711922` 端到端 | 下载成功，114,282,084 字节，与服务端 `Content-Range` 总长一致 |
+| MP4 轨校验（box 解析） | `['soun','vide']` **音视频合流**；末尾字节非全 0，数据完整 |
+| 6 条视频批量解析 | 6/6 成功，单条约 4~6 秒 |
+| 合集解析 | 3/3 正确（合集本身，非推荐流），封面/原声齐全 |
+| `-m all` 元数据 | `.mp4`/`.jpg`/`.mp3`/`.json`/`.txt` **五种产物齐全**（v0.6.0 只有 `.mp4`/`.txt`/`.json`） |
+
+**副产物**：解析不再需要等播放器起播，单条耗时从「等 5 秒起播」降到「等约 3 秒接口响应」。
